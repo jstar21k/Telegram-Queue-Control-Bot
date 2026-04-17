@@ -3,11 +3,12 @@ import secrets
 import logging
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -28,8 +29,21 @@ files_col = db['files']
 async def generate_token():
     return secrets.token_urlsafe(8)[:10]
 
+# --- KEYBOARDS ---
+def get_admin_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+        [InlineKeyboardButton("📂 Recent Files", callback_data="recent_files")],
+        [InlineKeyboardButton("🔄 Refresh Menu", callback_data="refresh")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- HANDLERS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
+    # User coming from Gateway link
     if context.args:
         token = context.args[0]
         file_data = await files_col.find_one({"token": token})
@@ -43,30 +57,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-    await update.message.reply_text("Welcome to JSTAR Admin Bot.")
+
+    # Admin Menu
+    if user_id == ADMIN_USER_ID:
+        await update.message.reply_text(
+            "👋 **Welcome Boss!**\nUse the buttons below to manage your bot.",
+            reply_markup=get_admin_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("Welcome to JSTAR Video Bot.")
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "stats":
+        total_files = await files_col.count_documents({})
+        cursor = files_col.aggregate([{"$group": {"_id": None, "total": {"$sum": "$total_downloads"}}}])
+        result = await cursor.to_list(length=1)
+        downloads = result[0]['total'] if result else 0
+        
+        text = f"📊 **Bot Stats**\n\n📁 Files: `{total_files}`\n📥 Total Downloads: `{downloads}`"
+        await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+
+    elif query.data == "recent_files":
+        cursor = files_col.find().sort("created_at", -1).limit(5)
+        files = await cursor.to_list(length=5)
+        if not files:
+            await query.edit_message_text("No files yet.", reply_markup=get_admin_keyboard())
+            return
+        
+        text = "📂 **Last 5 Files:**\n\n"
+        for f in files:
+            text += f"• `{f['file_name']}` (📥 {f['total_downloads']})\n"
+        await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+    
+    elif query.data == "refresh":
+        await query.edit_message_text("Admin Panel Refreshed ✅", reply_markup=get_admin_keyboard())
 
 async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID: return
 
     msg = update.message
-    
-    # Secure check for forward origin
     origin = msg.forward_origin
+    
     if not origin or not hasattr(origin, 'chat') or origin.chat.id != STORAGE_CHANNEL_ID:
-        await msg.reply_text("❌ Error: Forward the file from your Storage Channel.")
+        await msg.reply_text("❌ Error: Forward from Storage Channel!")
         return
 
-    # For channels, the message ID is stored in message_id of the origin if available
-    # or we use the message_id from the forwarded message metadata.
-    storage_id = getattr(origin, 'message_id', msg.forward_from_message_id if hasattr(msg, 'forward_from_message_id') else None)
-    
-    if not storage_id:
-        await msg.reply_text("❌ Could not detect original Message ID. Try forwarding again.")
-        return
+    # Extract ID correctly
+    storage_id = getattr(origin, 'message_id', msg.forward_from_message_id if hasattr(msg, 'forward_from_message_id') else msg.message_id)
 
     attachment = msg.effective_attachment
-    if not attachment or isinstance(attachment, list): return
-
     file_name = getattr(attachment, 'file_name', 'Video_File')
     token = await generate_token()
 
@@ -78,10 +121,15 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "total_downloads": 0
     })
 
-    await msg.reply_text(f"✅ **File Saved!**\n\nLink: {GATEWAY_URL}?token={token}")
+    await msg.reply_text(
+        f"✅ **Saved Successfully**\n\n"
+        f"🔗 **Link:** `{GATEWAY_URL}?token={token}`",
+        parse_mode="Markdown"
+    )
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_button))
     application.add_handler(MessageHandler(filters.FORWARDED & (filters.Document.ALL | filters.VIDEO), handle_forward))
     application.run_polling()

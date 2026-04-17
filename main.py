@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import secrets
 import logging
@@ -16,12 +17,9 @@ from telegram.ext import (
 
 # --- CONFIG ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SHARING_BOT_TOKEN = os.environ.get("SHARING_BOT_TOKEN") 
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
 MONGODB_URI = os.environ.get("MONGODB_URI")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
-
-# --- NEW URL UPDATED ---
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +48,7 @@ async def delete_files_job(context: ContextTypes.DEFAULT_TYPE):
 def get_admin_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 Full Statistics", callback_data="stats")],
+        # RECENT FILES BUTTON REMOVED
         [InlineKeyboardButton("🔌 Bot & DB Status", callback_data="status_check")],
         [InlineKeyboardButton("🔄 Refresh Menu", callback_data="refresh")]
     ]
@@ -68,7 +67,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await files_col.update_one({"token": token}, {"$inc": {"total_downloads": 1}})
             await logs_col.insert_one({"token": token, "time": datetime.now(timezone.utc)})
             
-            # 1. Send the file
+            # 1. Send the file (UPDATED CAPTION)
             file_msg = await context.bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=STORAGE_CHANNEL_ID,
@@ -83,7 +82,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
 
-            # 3. Schedule the deletion (600 seconds = 10 minutes)
+            # 3. Schedule the deletion (10 minutes)
             context.job_queue.run_once(
                 delete_files_job, 
                 when=600, 
@@ -119,7 +118,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await client.admin.command('ping')
             db_status = "✅ Connected"
+        except:
+            db_status = "❌ Disconnected"
 
+        # SHARING BOT LINE REMOVED
         text = (f"🔌 **SYSTEM STATUS**\n\n"
                 f"🗄 MongoDB: `{db_status}`\n"
                 f"🛰 Admin Bot: `✅ Running`")

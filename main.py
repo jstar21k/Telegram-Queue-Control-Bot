@@ -1,7 +1,7 @@
 import os
 import secrets
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update
 from telegram.ext import (
@@ -26,7 +26,6 @@ logging.basicConfig(level=logging.INFO)
 client = AsyncIOMotorClient(MONGODB_URI)
 db = client['tg_bot_db']
 files_col = db['files']
-settings_col = db['settings']
 
 async def generate_token():
     return secrets.token_urlsafe(8)[:10]
@@ -56,7 +55,8 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID: return
 
     msg = update.message
-    if not msg.forward_from_chat or msg.forward_from_chat.id != STORAGE_CHANNEL_ID:
+    # Check if it's a forward from the storage channel
+    if not msg.forward_origin or not hasattr(msg.forward_origin, 'chat') or msg.forward_origin.chat.id != STORAGE_CHANNEL_ID:
         await msg.reply_text("❌ Error: Forward the file from the Storage Channel.")
         return
 
@@ -69,23 +69,20 @@ async def handle_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await files_col.insert_one({
         "file_name": file_name,
         "token": token,
-        "storage_msg_id": msg.forward_from_message_id,
-        "created_at": datetime.utcnow(),
+        "storage_msg_id": msg.forward_from_message_id if hasattr(msg, 'forward_from_message_id') else msg.message_id,
+        "created_at": datetime.now(timezone.utc),
         "total_downloads": 0
     })
 
     link = f"{GATEWAY_URL}?token={token}"
     await msg.reply_text(f"✅ **File Saved!**\n\nLink: {link}")
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID: return
-    total = await files_col.count_documents({})
-    await update.message.reply_text(f"📊 Total Files: {total}")
-
 if __name__ == '__main__':
+    # Initialize Application
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Add Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stats", stats))
     application.add_handler(MessageHandler(filters.FORWARDED & (filters.Document.ALL | filters.VIDEO), handle_forward))
     
     print("Bot is starting...")

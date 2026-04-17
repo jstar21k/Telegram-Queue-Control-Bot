@@ -24,7 +24,6 @@ GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 
 logging.basicConfig(level=logging.INFO)
 
-# --- DATABASE ---
 client = AsyncIOMotorClient(MONGODB_URI)
 db = client['tg_bot_pro_db']
 files_col = db['files']
@@ -34,7 +33,6 @@ logs_col = db['downloads']
 async def generate_token():
     return secrets.token_urlsafe(8)[:10]
 
-# --- AUTO DELETER FUNCTION ---
 async def delete_files_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id, file_msg_id, warn_msg_id = job.data
@@ -44,17 +42,13 @@ async def delete_files_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Auto-delete failed: {e}")
 
-# --- KEYBOARDS ---
 def get_admin_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 Full Statistics", callback_data="stats")],
-        # RECENT FILES BUTTON REMOVED
         [InlineKeyboardButton("🔌 Bot & DB Status", callback_data="status_check")],
         [InlineKeyboardButton("🔄 Refresh Menu", callback_data="refresh")]
     ]
     return InlineKeyboardMarkup(keyboard)
-
-# --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -64,35 +58,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.args[0]
         file_data = await files_col.find_one({"token": token})
         if file_data:
-            await files_col.update_one({"token": token}, {"$inc": {"total_downloads": 1}})
-            await logs_col.insert_one({"token": token, "time": datetime.now(timezone.utc)})
-            
-            # 1. Send the file (UPDATED CAPTION)
-            file_msg = await context.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=STORAGE_CHANNEL_ID,
-                message_id=file_data['storage_msg_id'],
-                caption=f"🎥 **File:** {file_data['file_name']}\n🚀 **Delivered by @link69_viral**",
-                parse_mode="Markdown"
-            )
-            
-            # 2. Send the warning message
-            warn_msg = await update.message.reply_text(
-                "⚠️ **IMPORTANT:** Save this file to your 'Saved Messages' now. It will be automatically deleted in **10 minutes** for security.",
-                parse_mode="Markdown"
-            )
+            try:
+                # FIXED: Markdown ki jagah HTML use kiya hai taaki filename bot ko crash na kare
+                fname = file_data.get('file_name', 'Video')
+                caption_text = f"🎥 <b>File:</b> {fname}\n🚀 <b>Delivered by @link69_viral</b>"
+                
+                # 1. Send File
+                file_msg = await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=STORAGE_CHANNEL_ID,
+                    message_id=int(file_data['storage_msg_id']),
+                    caption=caption_text,
+                    parse_mode="HTML"
+                )
+                
+                # Update Stats
+                await files_col.update_one({"token": token}, {"$inc": {"total_downloads": 1}})
+                await logs_col.insert_one({"token": token, "time": datetime.now(timezone.utc)})
 
-            # 3. Schedule the deletion (10 minutes)
-            context.job_queue.run_once(
-                delete_files_job, 
-                when=600, 
-                data=[user_id, file_msg.message_id, warn_msg.message_id],
-                chat_id=user_id
-            )
+                # 2. Warning Message
+                warn_msg = await update.message.reply_text(
+                    "⚠️ <b>IMPORTANT:</b> Save this file to your 'Saved Messages' now. It will be deleted in <b>10 minutes</b>.",
+                    parse_mode="HTML"
+                )
+
+                # 3. Deletion Job (10 Minutes)
+                context.job_queue.run_once(delete_files_job, 600, [user_id, file_msg.message_id, warn_msg.message_id], chat_id=user_id)
+                
+            except Exception as e:
+                await update.message.reply_text(f"❌ <b>Error:</b> Bot file bhej nahi paa raha.\n\n<b>Reason:</b> {str(e)}", parse_mode="HTML")
+                logging.error(f"Delivery Error: {e}")
+            return
+        else:
+            await update.message.reply_text("❌ Invalid or Expired Link.")
             return
 
     if user_id == ADMIN_USER_ID:
-        await update.message.reply_text("💎 **JSTAR PRO ADMIN PANEL**", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text("💎 <b>JSTAR PRO ADMIN PANEL</b>", reply_markup=get_admin_keyboard(), parse_mode="HTML")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -104,15 +106,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor = files_col.aggregate([{"$group": {"_id": None, "total": {"$sum": "$total_downloads"}}}])
         res = await cursor.to_list(length=1)
         total_dl = res[0]['total'] if res else 0
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        today_dl = await logs_col.count_documents({"time": {"$gte": today_start}})
+        today_dl = await logs_col.count_documents({"time": {"$gte": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)}})
 
-        text = (f"📊 **BOT ANALYTICS**\n\n"
-                f"👥 Total Users: `{total_users}`\n"
-                f"🔗 Total Links: `{total_links}`\n"
-                f"📥 Total Downloads: `{total_dl}`\n"
-                f"📅 Downloads Today: `{today_dl}`")
-        await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+        text = (f"📊 <b>BOT ANALYTICS</b>\n\n👥 Total Users: <code>{total_users}</code>\n🔗 Total Links: <code>{total_links}</code>\n📥 Total Downloads: <code>{total_dl}</code>\n📅 Downloads Today: <code>{today_dl}</code>")
+        await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
 
     elif query.data == "status_check":
         try:
@@ -120,15 +117,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_status = "✅ Connected"
         except:
             db_status = "❌ Disconnected"
-
-        # SHARING BOT LINE REMOVED
-        text = (f"🔌 **SYSTEM STATUS**\n\n"
-                f"🗄 MongoDB: `{db_status}`\n"
-                f"🛰 Admin Bot: `✅ Running`")
-        await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+        await query.edit_message_text(f"🔌 <b>SYSTEM STATUS</b>\n\n🗄 MongoDB: <code>{db_status}</code>\n🛰 Admin Bot: <code>✅ Running</code>", reply_markup=get_admin_keyboard(), parse_mode="HTML")
 
     elif query.data == "refresh":
-        await query.edit_message_text("Panel Refreshed ✅", reply_markup=get_admin_keyboard())
+        await query.edit_message_text("Admin Panel Refreshed ✅", reply_markup=get_admin_keyboard())
 
 async def auto_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_post = update.channel_post
@@ -150,20 +142,15 @@ async def auto_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"{GATEWAY_URL}?token={token}"
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_USER_ID,
-            text=f"🚀 **Auto-Link Generated!**\n\n📁 File: `{file_name}`\n🔗 Link: `{link}`",
-            parse_mode="Markdown"
-        )
+        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"🚀 <b>Auto-Link Generated!</b>\n\n📁 File: <code>{file_name}</code>\n🔗 Link: <code>{link}</code>", parse_mode="HTML")
     except:
-        logging.error("Could not send link to admin.")
+        logging.error("Admin message fail.")
 
 if __name__ == '__main__':
+    # JobQueue ke liye specific build
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL), auto_post_handler))
-    
-    print("JSTAR Bot Started on vidplays.in...")
+    print("Bot is Live...")
     app.run_polling()

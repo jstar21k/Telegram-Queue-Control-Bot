@@ -20,7 +20,7 @@ SHARING_BOT_TOKEN = os.environ.get("SHARING_BOT_TOKEN")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
 MONGODB_URI = os.environ.get("MONGODB_URI")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://jstar21k.github.io/Vid-play-site/")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 
 logging.basicConfig(level=logging.INFO)
 

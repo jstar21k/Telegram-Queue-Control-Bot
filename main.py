@@ -20,6 +20,8 @@ SHARING_BOT_TOKEN = os.environ.get("SHARING_BOT_TOKEN")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
 MONGODB_URI = os.environ.get("MONGODB_URI")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
+
+# --- NEW URL UPDATED ---
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 
 logging.basicConfig(level=logging.INFO)
@@ -36,9 +38,7 @@ async def generate_token():
 
 # --- AUTO DELETER FUNCTION ---
 async def delete_files_job(context: ContextTypes.DEFAULT_TYPE):
-    """Callback function to delete the messages"""
     job = context.job
-    # job.data contains [chat_id, file_message_id, warning_message_id]
     chat_id, file_msg_id, warn_msg_id = job.data
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=file_msg_id)
@@ -50,7 +50,6 @@ async def delete_files_job(context: ContextTypes.DEFAULT_TYPE):
 def get_admin_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 Full Statistics", callback_data="stats")],
-        [InlineKeyboardButton("📂 Recent Files", callback_data="recent_files")],
         [InlineKeyboardButton("🔌 Bot & DB Status", callback_data="status_check")],
         [InlineKeyboardButton("🔄 Refresh Menu", callback_data="refresh")]
     ]
@@ -94,7 +93,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if user_id == ADMIN_USER_ID:
-        await update.message.reply_text("💎 **J-STAR ADMIN PANEL**", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+        await update.message.reply_text("💎 **JSTAR PRO ADMIN PANEL**", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -120,17 +119,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await client.admin.command('ping')
             db_status = "✅ Connected"
-        except:
-            db_status = "❌ Disconnected"
-
-        bot1_status = "❌ Offline (No Token)"
-        if SHARING_BOT_TOKEN:
-            try:
-                temp_bot = Bot(SHARING_BOT_TOKEN)
-                me = await temp_bot.get_me()
-                bot1_status = f"✅ Online (@{me.username})"
-            except:
-                bot1_status = "❌ Token Invalid"
 
         text = (f"🔌 **SYSTEM STATUS**\n\n"
                 f"🗄 MongoDB: `{db_status}`\n"
@@ -169,12 +157,11 @@ async def auto_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error("Could not send link to admin.")
 
 if __name__ == '__main__':
-    # Initialize Application with JobQueue
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL), auto_post_handler))
     
-    print("JSTAR Pro Bot Started with Auto-Deleter...")
+    print("JSTAR Bot Started on vidplays.in...")
     app.run_polling()

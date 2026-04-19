@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault
 )
 from telegram.ext import (
@@ -120,7 +120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upsert=True,
     )
 
-    # ── /start token? → deliver file with force-join check ──
+    # ── /start token → deliver file ──
     if context.args:
         token = context.args[0]
         file_data = await files_col.find_one({"token": token})
@@ -132,51 +132,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Force-join check
         joined = await is_joined(context.bot, user.id)
         if not joined:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")
-            ]])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
+                [InlineKeyboardButton("✅ I've Joined", callback_data="check_join")],
+            ])
             await update.message.reply_text(
                 "🔒 <b>Access Denied!</b>\n\n"
                 "You must join our channel to get the file.\n"
-                "Join below, then click the link again 👇",
+                "Join below, then tap <b>I've Joined</b> 👇",
                 reply_markup=kb,
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
-            # Save pending token so we can check again
             context.user_data['pending_token'] = token
             return
 
-        # Deliver file
         await deliver_file(update, context, file_data)
         return
 
-    # ── Normal start (no token) ──
+    # ── Normal /start ──
     if user.id == ADMIN_USER_ID:
         await update.message.reply_text(
             "💎 <b>JSTAR PRO ADMIN PANEL</b>\n\n"
-            "/post — Create a channel post\n"
+            "/post — Create channel post\n"
             "/recent — View last 5 uploads",
             reply_markup=admin_kb(),
             parse_mode="HTML",
         )
         return
 
-    # Regular user — show force-join
     joined = await is_joined(context.bot, user.id)
     if joined:
         await update.message.reply_text(
-            "👋 Welcome back!\n\n"
-            "Send me a link to get your file.",
+            "👋 Welcome back!\n\nSend me a link to get your file.",
             parse_mode="HTML",
         )
     else:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")
-        ]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
+            [InlineKeyboardButton("✅ I've Joined", callback_data="check_join")],
+        ])
         await update.message.reply_text(
             "👋 Welcome!\n\n"
             "🔒 <b>Join our channel first</b> to access files.\n"
-            "Join below, then tap /start again 👇",
+            "Join below, then tap <b>I've Joined</b> 👇",
             reply_markup=kb,
             parse_mode="HTML",
         )
@@ -520,77 +518,6 @@ async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ <b>Welcome!</b>\n\nNow send me your link to get the file.",
         parse_mode="HTML",
     )
-
-
-# ━━━ FORCE JOIN BUTTON UPDATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Override the start's force-join keyboard to include "I've Joined"
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await users_col.update_one(
-        {"user_id": user.id},
-        {"$set": {"last_seen": datetime.now(timezone.utc), "name": user.full_name}},
-        upsert=True,
-    )
-
-    # ── /start token → deliver file ──
-    if context.args:
-        token = context.args[0]
-        file_data = await files_col.find_one({"token": token})
-
-        if not file_data:
-            await update.message.reply_text("❌ Invalid or expired link.")
-            return
-
-        # Force-join check
-        joined = await is_joined(context.bot, user.id)
-        if not joined:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
-                [InlineKeyboardButton("✅ I've Joined", callback_data="check_join")],
-            ])
-            await update.message.reply_text(
-                "🔒 <b>Access Denied!</b>\n\n"
-                "You must join our channel to get the file.\n"
-                "Join below, then tap <b>I've Joined</b> 👇",
-                reply_markup=kb,
-                parse_mode="HTML",
-            )
-            context.user_data['pending_token'] = token
-            return
-
-        await deliver_file(update, context, file_data)
-        return
-
-    # ── Normal /start ──
-    if user.id == ADMIN_USER_ID:
-        await update.message.reply_text(
-            "💎 <b>JSTAR PRO ADMIN PANEL</b>\n\n"
-            "/post — Create channel post\n"
-            "/recent — View last 5 uploads",
-            reply_markup=admin_kb(),
-            parse_mode="HTML",
-        )
-        return
-
-    joined = await is_joined(context.bot, user.id)
-    if joined:
-        await update.message.reply_text(
-            "👋 Welcome back!\n\nSend me a link to get your file.",
-            parse_mode="HTML",
-        )
-    else:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
-            [InlineKeyboardButton("✅ I've Joined", callback_data="check_join")],
-        ])
-        await update.message.reply_text(
-            "👋 Welcome!\n\n"
-            "🔒 <b>Join our channel first</b> to access files.\n"
-            "Join below, then tap <b>I've Joined</b> 👇",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
 
 
 # ━━━ MAIN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

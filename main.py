@@ -19,6 +19,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
 MONGODB_URI = os.environ.get("MONGODB_URI")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
+POST_CHANNEL_ID = int(os.environ.get("POST_CHANNEL_ID", 0))  # channel where bot posts thumbnails
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 FORCE_JOIN_CHANNEL = "link69_viral"  # without @
 
@@ -480,16 +481,35 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cap = f"{secrets.choice(CAPTIONS)}\n\n⏱ Duration: {pending['duration']}"
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=link)]])
 
-    await context.bot.send_message(
-        chat_id=ADMIN_USER_ID,
-        text=f"📝 <b>Post (no thumbnail):</b>\n\n{cap}",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-    await update.message.reply_text(
-        "✅ <b>Done!</b> Forward above to your channel.",
-        parse_mode="HTML",
-    )
+    # Post directly to channel
+    if POST_CHANNEL_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=POST_CHANNEL_ID,
+                text=cap,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            await update.message.reply_text(
+                "✅ <b>Posted to channel!</b>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID & bot admin rights.",
+                parse_mode="HTML",
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=f"📝 <b>Post:</b>\n\n{cap}",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        await update.message.reply_text(
+            "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
+            parse_mode="HTML",
+        )
     _pending_post.pop(user_id, None)
 
 
@@ -507,7 +527,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("❌ Session expired.", show_alert=True)
         return
 
-    # ── SEND NOW ──
+    # ── SEND NOW → post directly to channel ──
     if q.data == "pc_send":
         link = f"{GATEWAY_URL}?token={pending['token']}"
         cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
@@ -519,19 +539,38 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Send final post to admin
-        await context.bot.send_photo(
-            chat_id=ADMIN_USER_ID,
-            photo=pending['thumb'],
-            caption=cap,
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-        await context.bot.send_message(
-            chat_id=ADMIN_USER_ID,
-            text="✅ <b>Done!</b> Forward the post above to your channel.",
-            parse_mode="HTML",
-        )
+        # Post directly to channel
+        if POST_CHANNEL_ID:
+            try:
+                await context.bot.send_photo(
+                    chat_id=POST_CHANNEL_ID,
+                    photo=pending['thumb'],
+                    caption=cap,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                )
+                await q.message.reply_text(
+                    "✅ <b>Posted to channel!</b>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await q.message.reply_text(
+                    f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID & bot admin rights.",
+                    parse_mode="HTML",
+                )
+        else:
+            # Fallback: send to admin if POST_CHANNEL_ID not set
+            await context.bot.send_photo(
+                chat_id=ADMIN_USER_ID,
+                photo=pending['thumb'],
+                caption=cap,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            await q.message.reply_text(
+                "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
+                parse_mode="HTML",
+            )
         _pending_post.pop(user_id, None)
 
     # ── NEW CAPTION ──

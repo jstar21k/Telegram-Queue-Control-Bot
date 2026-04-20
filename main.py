@@ -22,6 +22,7 @@ STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
 POST_CHANNEL_ID = int(os.environ.get("POST_CHANNEL_ID", 0))  # channel where bot posts thumbnails
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 FORCE_JOIN_CHANNEL = "link69_viral"  # without @
+HOW_TO_OPEN_LINK = "https://t.me/c/2047194577/41"  # Instructions for opening links
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,7 +54,7 @@ CAPTIONS = [
 "Isse zyada hot aur kya ho sakta hai? 🤯🔥 Challenge accepted?",
 "Sirf close friends ke liye... par tumhare liye public kiya! 😈💌",
 "Kal raat viral hua tha, ab yahan available! 🔥📲",
-"Agar ye pasand aaya toh '🔥' react karo! Let’s see power! 👇",
+"Agar ye pasand aaya toh '🔥' react karo! Let's see power! 👇",
 "Ye angle kisi ne nahi dekha hoga! 📸😲 Unique clip!",
 "Thoda sa naughty, thoda sa crazy! 😜💦 Perfect combo.",
 "Apne best friend ko bhejo jo single hai! 😂👇 Tag him!",
@@ -97,6 +98,14 @@ def preview_kb():
          InlineKeyboardButton("🔄 New Caption", callback_data="pc_rot")],
         [InlineKeyboardButton("🖼 New Thumb", callback_data="pc_rethumb"),
          InlineKeyboardButton("❌ Cancel", callback_data="pc_cancel")],
+    ])
+
+
+def get_channel_kb(link: str):
+    """Get keyboard for channel posts with Watch Now + How to Open Link buttons."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Watch Now", url=link)],
+        [InlineKeyboardButton("📖 How to Open Link", url=HOW_TO_OPEN_LINK)],
     ])
 
 
@@ -262,9 +271,14 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
             parse_mode="HTML",
         )
 
-        # Stats
+        # Stats - track download with user_id (exclude admin from counting)
         await files_col.update_one({"token": token}, {"$inc": {"total_downloads": 1}})
-        await logs_col.insert_one({"token": token, "time": datetime.now(timezone.utc)})
+        await logs_col.insert_one({
+            "token": token,
+            "user_id": user_id,  # Track user for analytics
+            "is_admin": user_id == ADMIN_USER_ID,  # Mark admin downloads
+            "time": datetime.now(timezone.utc)
+        })
 
         # Warning + auto-delete after 10 min (send directly to user, not reply)
         warn_msg = await context.bot.send_message(
@@ -343,23 +357,52 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "stats":
-        total_links = await files_col.count_documents({})
-        total_users = await users_col.count_documents({})
-        agg = await files_col.aggregate(
-            [{"$group": {"_id": None, "dl": {"$sum": "$total_downloads"}}}]
-        ).to_list(1)
-        total_dl = agg[0]['dl'] if agg else 0
-        today = datetime.now(timezone.utc).replace(
+        # Get current time for today calculations
+        today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        today_dl = await logs_col.count_documents({"time": {"$gte": today}})
+
+        # Total links count
+        total_links = await files_col.count_documents({})
+
+        # Total users count
+        total_users = await users_col.count_documents({})
+
+        # New users today
+        new_users_today = await users_col.count_documents({
+            "last_seen": {"$gte": today_start}
+        })
+
+        # Total downloads (all)
+        agg_all = await logs_col.aggregate(
+            [{"$group": {"_id": None, "dl": {"$sum": 1}}}]
+        ).to_list(1)
+        total_dl_all = agg_all[0]['dl'] if agg_all else 0
+
+        # User downloads only (exclude admin)
+        agg_users = await logs_col.aggregate([
+            {"$match": {"is_admin": {"$ne": True}}},  # Exclude admin
+            {"$group": {"_id": None, "dl": {"$sum": 1}}}
+        ]).to_list(1)
+        total_dl_users = agg_users[0]['dl'] if agg_users else 0
+
+        # Downloads today (user only, exclude admin)
+        today_dl = await logs_col.count_documents({
+            "time": {"$gte": today_start},
+            "is_admin": {"$ne": True}  # Exclude admin
+        })
+
+        # New users who joined today (based on last_seen >= today)
+        # This is same as new_users_today
 
         await query.edit_message_text(
-            f"📊 <b>ANALYTICS</b>\n\n"
-            f"👥 Users: <code>{total_users}</code>\n"
-            f"🔗 Links: <code>{total_links}</code>\n"
-            f"📥 Downloads: <code>{total_dl}</code>\n"
-            f"📅 Today: <code>{today_dl}</code>",
+            f"📊 <b>DETAILED ANALYTICS</b>\n\n"
+            f"👥 Total Users: <code>{total_users}</code>\n"
+            f"👥 New Today: <code>{new_users_today}</code>\n"
+            f"🔗 Total Links: <code>{total_links}</code>\n"
+            f"📥 Downloads (Users): <code>{total_dl_users}</code>\n"
+            f"📥 Downloads (All incl. Admin): <code>{total_dl_all}</code>\n"
+            f"📅 Downloads Today: <code>{today_dl}</code>",
             reply_markup=admin_kb(), parse_mode="HTML",
         )
 
@@ -495,15 +538,14 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link = f"{GATEWAY_URL}?token={pending['token']}"
     cap = f"{secrets.choice(CAPTIONS)}\n\n⏱ Duration: {pending['duration']}"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=link)]])
 
-    # Post directly to channel
+    # Post directly to channel with BOTH buttons
     if POST_CHANNEL_ID:
         try:
             await context.bot.send_message(
                 chat_id=POST_CHANNEL_ID,
                 text=cap,
-                reply_markup=kb,
+                reply_markup=get_channel_kb(link),
                 parse_mode="HTML",
             )
             await update.message.reply_text(
@@ -519,7 +561,7 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=ADMIN_USER_ID,
             text=f"📝 <b>Post:</b>\n\n{cap}",
-            reply_markup=kb,
+            reply_markup=get_channel_kb(link),
             parse_mode="HTML",
         )
         await update.message.reply_text(
@@ -547,7 +589,6 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "pc_send":
         link = f"{GATEWAY_URL}?token={pending['token']}"
         cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=link)]])
 
         # Remove buttons from preview
         try:
@@ -555,7 +596,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Post directly to channel
+        # Post directly to channel with BOTH buttons
         if POST_CHANNEL_ID:
             try:
                 await context.bot.send_photo(
@@ -563,7 +604,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     photo=pending['thumb'],
                     caption=cap,
                     parse_mode="HTML",
-                    reply_markup=kb,
+                    reply_markup=get_channel_kb(link),
                 )
                 await q.message.reply_text(
                     "✅ <b>Posted to channel!</b>",
@@ -581,7 +622,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 photo=pending['thumb'],
                 caption=cap,
                 parse_mode="HTML",
-                reply_markup=kb,
+                reply_markup=get_channel_kb(link),
             )
             await q.message.reply_text(
                 "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",

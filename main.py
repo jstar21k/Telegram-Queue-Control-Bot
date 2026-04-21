@@ -229,7 +229,7 @@ async def post_init(application):
 async def publish_pending_post(context: ContextTypes.DEFAULT_TYPE, pending: dict, thumb_data: dict):
     link = f"{GATEWAY_URL}?token={pending['token']}"
     caption_text = pending.get('caption') or secrets.choice(CAPTIONS)
-    caption = f"{caption_text}\n\nâ± Duration: {pending['duration']}"
+    caption = f"{caption_text}\n\n⏱ Duration: {pending['duration']}"
 
     if POST_CHANNEL_ID:
         posted_message = await context.bot.send_photo(

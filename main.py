@@ -3,8 +3,10 @@ import asyncio
 import os
 import secrets
 import logging
+import re
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
 from telegram import (
     Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault
@@ -19,12 +21,16 @@ from telegram.constants import ChatMemberStatus
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
 MONGODB_URI = os.environ.get("MONGODB_URI")
+INTAKE_CHANNEL_ID = int(os.environ.get("INTAKE_CHANNEL_ID", 0))
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
 POST_CHANNEL_ID = int(os.environ.get("POST_CHANNEL_ID", 0))  # channel where bot posts thumbnails
 THUMBNAIL_CHANNEL_ID = int(os.environ.get("THUMBNAIL_CHANNEL_ID", 0))
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 FORCE_JOIN_CHANNEL = "link69_viral"  # without @
 HOW_TO_OPEN_LINK = "https://t.me/c/2047194577/41"  # Instructions for opening links
+THUMBNAIL_UPLOAD_DELAY_SECONDS = int(os.environ.get("THUMBNAIL_UPLOAD_DELAY_SECONDS", "3"))
+INTAKE_GROUP_SETTLE_SECONDS = float(os.environ.get("INTAKE_GROUP_SETTLE_SECONDS", "2"))
+QUEUE_CONFIRMATION_TEXT = os.environ.get("QUEUE_CONFIRMATION_TEXT", "post done").strip().lower()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +45,7 @@ users_col = db['users']
 logs_col = db['downloads']
 sync_col = db['bot_sync']
 processed_posts_col = db['processed_posts']
+queue_posts_col = db['queue_posts']
 
 # ━━━ PRELOADED CAPTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CAPTIONS = [
@@ -69,6 +76,190 @@ CAPTIONS = [
 # This dict holds the pending post info until flow completes.
 _pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
 POST_FLOW_LOCK = asyncio.Lock()
+QUEUE_FLOW_LOCK = asyncio.Lock()
+_active_queue_item = None
+_intake_groups = {}
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def classify_intake_message(post):
+    if post.video:
+        return "video"
+    if post.photo:
+        return "thumbnail"
+    if post.document:
+        mime_type = (post.document.mime_type or "").lower()
+        if mime_type.startswith("video/"):
+            return "video"
+        if mime_type.startswith("image/"):
+            return "thumbnail"
+    return None
+
+
+def build_intake_key(post):
+    return str(post.media_group_id or f"single:{post.message_id}")
+
+
+def extract_storage_message_id(text: str):
+    match = re.search(r"storage_msg_id:\s*(\d+)", text, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+async def update_queue_item(queue_id, data: dict):
+    return await queue_posts_col.find_one_and_update(
+        {"_id": queue_id},
+        {"$set": {**data, "updated_at": utcnow()}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def enqueue_intake_post(group: dict):
+    now = utcnow()
+    queue_doc = {
+        "intake_key": group["intake_key"],
+        "intake_channel_id": group["chat_id"],
+        "media_group_id": group.get("media_group_id"),
+        "intake_message_ids": sorted(group["message_ids"]),
+        "thumbnail_source_message_id": group["thumbnail_source_message_id"],
+        "video_source_message_id": group["video_source_message_id"],
+        "source_caption": group.get("caption") or "",
+        "status": "pending",
+        "stage": "queued",
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = await queue_posts_col.update_one(
+        {"intake_key": group["intake_key"]},
+        {"$setOnInsert": queue_doc},
+        upsert=True,
+    )
+    item = await queue_posts_col.find_one({"intake_key": group["intake_key"]})
+    return item, bool(result.upserted_id)
+
+
+async def dispatch_queue_item(application, item: dict):
+    bot = application.bot
+    current = item
+    stage = current.get("stage") or "queued"
+
+    if stage in {"queued", "claimed"}:
+        thumb_message = await bot.copy_message(
+            chat_id=THUMBNAIL_CHANNEL_ID,
+            from_chat_id=current["intake_channel_id"],
+            message_id=current["thumbnail_source_message_id"],
+        )
+        current = await update_queue_item(
+            current["_id"],
+            {
+                "stage": "thumbnail_sent",
+                "thumbnail_channel_message_id": thumb_message.message_id,
+                "thumbnail_sent_at": utcnow(),
+            },
+        )
+        stage = current.get("stage")
+
+    if stage == "thumbnail_sent" and not current.get("storage_message_id"):
+        sent_at = current.get("thumbnail_sent_at")
+        if sent_at:
+            elapsed = (utcnow() - sent_at).total_seconds()
+            remaining = THUMBNAIL_UPLOAD_DELAY_SECONDS - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+        storage_message = await bot.copy_message(
+            chat_id=STORAGE_CHANNEL_ID,
+            from_chat_id=current["intake_channel_id"],
+            message_id=current["video_source_message_id"],
+        )
+        current = await update_queue_item(
+            current["_id"],
+            {
+                "stage": "video_sent",
+                "storage_message_id": storage_message.message_id,
+                "storage_sent_at": utcnow(),
+            },
+        )
+
+    return current
+
+
+async def process_queue(application):
+    global _active_queue_item
+
+    if not (INTAKE_CHANNEL_ID and THUMBNAIL_CHANNEL_ID and STORAGE_CHANNEL_ID):
+        return
+
+    async with QUEUE_FLOW_LOCK:
+        item = await queue_posts_col.find_one(
+            {"status": "processing"},
+            sort=[("processing_started_at", 1), ("created_at", 1)],
+        )
+        if not item:
+            item = await queue_posts_col.find_one_and_update(
+                {"status": "pending"},
+                {
+                    "$set": {
+                        "status": "processing",
+                        "processing_started_at": utcnow(),
+                        "updated_at": utcnow(),
+                    }
+                },
+                sort=[("created_at", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+        if not item:
+            _active_queue_item = None
+            return
+
+        _active_queue_item = item
+
+        try:
+            updated_item = await dispatch_queue_item(application, item)
+            _active_queue_item = updated_item
+            logging.info(
+                "Queue item waiting confirmation | intake_key=%s | storage_message_id=%s",
+                updated_item["intake_key"],
+                updated_item.get("storage_message_id"),
+            )
+        except Exception as e:
+            logging.exception("Queue dispatch failed for intake_key=%s", item["intake_key"])
+            _active_queue_item = None
+            latest_item = await queue_posts_col.find_one({"_id": item["_id"]}) or item
+            await update_queue_item(
+                item["_id"],
+                {
+                    "status": "pending",
+                    "stage": latest_item.get("stage") or "queued",
+                    "last_error": str(e)[:1000],
+                    "last_error_at": utcnow(),
+                },
+            )
+
+
+async def finalize_intake_group(application, intake_key: str):
+    group = _intake_groups.pop(intake_key, None)
+    if not group:
+        return
+
+    if not group.get("thumbnail_source_message_id") or not group.get("video_source_message_id"):
+        logging.info("Ignoring incomplete intake post | intake_key=%s", intake_key)
+        return
+
+    item, created = await enqueue_intake_post(group)
+    if created:
+        logging.info("Queued intake post | intake_key=%s", intake_key)
+    else:
+        logging.info("Intake post already queued | intake_key=%s", intake_key)
+
+    if item and item.get("status") != "done":
+        await process_queue(application)
+
+
+async def finalize_intake_group_job(context: ContextTypes.DEFAULT_TYPE):
+    await finalize_intake_group(context.application, context.job.data["intake_key"])
 
 
 # ━━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -220,10 +411,20 @@ async def ensure_database_indexes():
         [("post_id", 1), ("storage_channel_id", 1), ("processed", 1)],
         name="processed_post_lookup_idx",
     )
+    await queue_posts_col.create_index(
+        [("intake_key", 1)],
+        unique=True,
+        name="queue_intake_key_unique_idx",
+    )
+    await queue_posts_col.create_index(
+        [("status", 1), ("created_at", 1)],
+        name="queue_status_created_idx",
+    )
 
 
 async def post_init(application):
     await ensure_database_indexes()
+    await process_queue(application)
 
 
 async def publish_pending_post(context: ContextTypes.DEFAULT_TYPE, pending: dict, thumb_data: dict):
@@ -632,6 +833,107 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  INTAKE CHANNEL QUEUE CONTROLLER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def on_intake_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    post = update.channel_post
+    if not post or post.chat_id != INTAKE_CHANNEL_ID:
+        return
+
+    item_type = classify_intake_message(post)
+    if not item_type:
+        return
+
+    intake_key = build_intake_key(post)
+    group = _intake_groups.setdefault(
+        intake_key,
+        {
+            "intake_key": intake_key,
+            "chat_id": post.chat_id,
+            "media_group_id": post.media_group_id,
+            "message_ids": set(),
+            "thumbnail_source_message_id": None,
+            "video_source_message_id": None,
+            "caption": "",
+        },
+    )
+
+    group["message_ids"].add(post.message_id)
+    if post.caption and not group["caption"]:
+        group["caption"] = post.caption
+
+    if item_type == "thumbnail" and not group.get("thumbnail_source_message_id"):
+        group["thumbnail_source_message_id"] = post.message_id
+    elif item_type == "video" and not group.get("video_source_message_id"):
+        group["video_source_message_id"] = post.message_id
+
+    job_name = f"intake-settle:{intake_key}"
+    for job in context.job_queue.get_jobs_by_name(job_name):
+        job.schedule_removal()
+    context.job_queue.run_once(
+        finalize_intake_group_job,
+        INTAKE_GROUP_SETTLE_SECONDS,
+        data={"intake_key": intake_key},
+        name=job_name,
+    )
+
+
+async def on_storage_queue_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _active_queue_item
+
+    post = update.channel_post
+    if not post or post.chat_id != STORAGE_CHANNEL_ID or not post.text:
+        return
+
+    confirmation_text = post.text.strip()
+    if QUEUE_CONFIRMATION_TEXT not in confirmation_text.lower():
+        return
+
+    active_item = _active_queue_item
+    if not active_item:
+        active_item = await queue_posts_col.find_one(
+            {"status": "processing", "stage": "video_sent"},
+            sort=[("processing_started_at", 1), ("created_at", 1)],
+        )
+    if not active_item:
+        logging.info("Storage confirmation ignored because no queue item is active.")
+        return
+
+    confirmed_storage_message_id = extract_storage_message_id(confirmation_text)
+    expected_storage_message_id = active_item.get("storage_message_id")
+    if (
+        confirmed_storage_message_id
+        and expected_storage_message_id
+        and confirmed_storage_message_id != expected_storage_message_id
+    ):
+        logging.info(
+            "Storage confirmation ignored | expected_storage_message_id=%s | confirmed_storage_message_id=%s",
+            expected_storage_message_id,
+            confirmed_storage_message_id,
+        )
+        return
+
+    await update_queue_item(
+        active_item["_id"],
+        {
+            "status": "done",
+            "stage": "done",
+            "confirmation_message_id": post.message_id,
+            "confirmation_text": confirmation_text[:2000],
+            "confirmed_at": utcnow(),
+        },
+    )
+    logging.info(
+        "Queue item completed | intake_key=%s | storage_message_id=%s",
+        active_item["intake_key"],
+        expected_storage_message_id,
+    )
+    _active_queue_item = None
+    await process_queue(context.application)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  STORAGE UPLOAD → AUTO-LINK + ASK THUMBNAIL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -968,10 +1270,23 @@ if __name__ == '__main__':
     # Post preview buttons (send/rotate/rethumb/cancel)
     app.add_handler(CallbackQueryHandler(post_callback, pattern="^pc_"))
 
+    # Intake channel post assembly → queue controller
+    if INTAKE_CHANNEL_ID:
+        app.add_handler(MessageHandler(
+            filters.Chat(INTAKE_CHANNEL_ID) & (filters.PHOTO | filters.VIDEO | filters.Document.ALL),
+            on_intake_channel_post,
+        ))
+
     # Admin sends photo → check if pending post needs thumbnail
     app.add_handler(MessageHandler(
         filters.Chat(THUMBNAIL_CHANNEL_ID) & (filters.PHOTO | filters.Document.IMAGE),
         on_thumbnail_channel_post,
+    ))
+
+    # Storage channel confirmation → release next queued post
+    app.add_handler(MessageHandler(
+        filters.Chat(STORAGE_CHANNEL_ID) & filters.TEXT,
+        on_storage_queue_confirmation,
     ))
 
     # Storage channel upload → auto-link + ask thumbnail

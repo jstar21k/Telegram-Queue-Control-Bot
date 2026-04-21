@@ -18,19 +18,40 @@ from telegram.ext import (
 from telegram.constants import ChatMemberStatus
 
 # ━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
-MONGODB_URI = os.environ.get("MONGODB_URI")
-INTAKE_CHANNEL_ID = int(os.environ.get("INTAKE_CHANNEL_ID", 0))
-STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
-POST_CHANNEL_ID = int(os.environ.get("POST_CHANNEL_ID", 0))  # channel where bot posts thumbnails
-THUMBNAIL_CHANNEL_ID = int(os.environ.get("THUMBNAIL_CHANNEL_ID", 0))
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
-FORCE_JOIN_CHANNEL = "link69_viral"  # without @
-HOW_TO_OPEN_LINK = "https://t.me/c/2047194577/41"  # Instructions for opening links
-THUMBNAIL_UPLOAD_DELAY_SECONDS = int(os.environ.get("THUMBNAIL_UPLOAD_DELAY_SECONDS", "3"))
-INTAKE_GROUP_SETTLE_SECONDS = float(os.environ.get("INTAKE_GROUP_SETTLE_SECONDS", "2"))
-QUEUE_CONFIRMATION_TEXT = os.environ.get("QUEUE_CONFIRMATION_TEXT", "post done").strip().lower()
+def get_env(*names, default=None):
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def get_int_env(*names, default=0):
+    raw = get_env(*names)
+    if raw is None:
+        return default
+    return int(raw)
+
+
+BOT_TOKEN = get_env("BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+ADMIN_USER_ID = get_int_env("ADMIN_USER_ID", default=0)
+MONGODB_URI = get_env("MONGODB_URI")
+INTAKE_CHANNEL_ID = get_int_env("INTAKE_CHANNEL_ID", "INTAKE_CHAT_ID", default=0)
+STORAGE_CHANNEL_ID = get_int_env("STORAGE_CHANNEL_ID", "STORAGE_CHAT_ID", default=0)
+POST_CHANNEL_ID = get_int_env("POST_CHANNEL_ID", default=0)  # channel where bot posts thumbnails
+THUMBNAIL_CHANNEL_ID = get_int_env(
+    "THUMBNAIL_CHANNEL_ID",
+    "THUMBNAIL_CHAT_ID",
+    "THUMBNAIL_SOURCE_CHANNEL_ID",
+    "CONTROL_CHAT_ID",
+    default=0,
+)
+GATEWAY_URL = get_env("GATEWAY_URL", default="https://vidplays.in/")
+FORCE_JOIN_CHANNEL = get_env("FORCE_JOIN_CHANNEL", default="link69_viral")  # without @
+HOW_TO_OPEN_LINK = get_env("HOW_TO_OPEN_LINK", default="https://t.me/c/2047194577/41")
+THUMBNAIL_UPLOAD_DELAY_SECONDS = get_int_env("THUMBNAIL_UPLOAD_DELAY_SECONDS", default=3)
+INTAKE_GROUP_SETTLE_SECONDS = float(get_env("INTAKE_GROUP_SETTLE_SECONDS", default="2"))
+QUEUE_CONFIRMATION_TEXT = get_env("QUEUE_CONFIRMATION_TEXT", "CONFIRMATION_TEXT", default="post done").strip().lower()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,14 +59,14 @@ logging.basicConfig(
 )
 
 # ━━━ DATABASE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-client = AsyncIOMotorClient(MONGODB_URI)
-db = client['tg_bot_pro_db']
-files_col = db['files']
-users_col = db['users']
-logs_col = db['downloads']
-sync_col = db['bot_sync']
-processed_posts_col = db['processed_posts']
-queue_posts_col = db['queue_posts']
+client = None
+db = None
+files_col = None
+users_col = None
+logs_col = None
+sync_col = None
+processed_posts_col = None
+queue_posts_col = None
 
 # ━━━ PRELOADED CAPTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CAPTIONS = [
@@ -260,6 +281,37 @@ async def finalize_intake_group(application, intake_key: str):
 
 async def finalize_intake_group_job(context: ContextTypes.DEFAULT_TYPE):
     await finalize_intake_group(context.application, context.job.data["intake_key"])
+
+
+def init_database():
+    global client, db, files_col, users_col, logs_col, sync_col, processed_posts_col, queue_posts_col
+
+    if client is not None:
+        return
+
+    client = AsyncIOMotorClient(MONGODB_URI)
+    db = client['tg_bot_pro_db']
+    files_col = db['files']
+    users_col = db['users']
+    logs_col = db['downloads']
+    sync_col = db['bot_sync']
+    processed_posts_col = db['processed_posts']
+    queue_posts_col = db['queue_posts']
+
+
+def validate_runtime_config():
+    required = {
+        "BOT_TOKEN / TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+        "MONGODB_URI": MONGODB_URI,
+        "INTAKE_CHANNEL_ID / INTAKE_CHAT_ID": INTAKE_CHANNEL_ID,
+        "STORAGE_CHANNEL_ID / STORAGE_CHAT_ID": STORAGE_CHANNEL_ID,
+        "THUMBNAIL_CHANNEL_ID / THUMBNAIL_SOURCE_CHANNEL_ID": THUMBNAIL_CHANNEL_ID,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variables: " + ", ".join(missing)
+        )
 
 
 # ━━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1255,6 +1307,20 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ━━━ MAIN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if __name__ == '__main__':
+    try:
+        validate_runtime_config()
+        init_database()
+        logging.info(
+            "Startup config loaded | intake=%s | thumbnail=%s | storage=%s | post=%s",
+            INTAKE_CHANNEL_ID,
+            THUMBNAIL_CHANNEL_ID,
+            STORAGE_CHANNEL_ID,
+            POST_CHANNEL_ID or "disabled",
+        )
+    except Exception:
+        logging.exception("Fatal startup configuration error")
+        raise
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Commands
@@ -1296,4 +1362,8 @@ if __name__ == '__main__':
     ))
 
     print("🚀 JSTAR PRO Bot is Live...")
-    app.run_polling()
+    try:
+        app.run_polling()
+    except Exception:
+        logging.exception("Fatal runtime error")
+        raise

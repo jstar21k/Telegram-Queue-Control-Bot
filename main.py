@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import os
 import secrets
 import logging
@@ -20,6 +21,7 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
 MONGODB_URI = os.environ.get("MONGODB_URI")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", 0))
 POST_CHANNEL_ID = int(os.environ.get("POST_CHANNEL_ID", 0))  # channel where bot posts thumbnails
+THUMBNAIL_CHANNEL_ID = int(os.environ.get("THUMBNAIL_CHANNEL_ID", 0))
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 FORCE_JOIN_CHANNEL = "link69_viral"  # without @
 HOW_TO_OPEN_LINK = "https://t.me/c/2047194577/41"  # Instructions for opening links
@@ -35,6 +37,7 @@ db = client['tg_bot_pro_db']
 files_col = db['files']
 users_col = db['users']
 logs_col = db['downloads']
+sync_col = db['bot_sync']
 
 # ━━━ PRELOADED CAPTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CAPTIONS = [
@@ -64,6 +67,7 @@ CAPTIONS = [
 # When admin uploads to storage, bot auto-asks for thumbnail.
 # This dict holds the pending post info until flow completes.
 _pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
+POST_FLOW_LOCK = asyncio.Lock()
 
 
 # ━━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -107,6 +111,169 @@ def get_channel_kb(link: str):
         [InlineKeyboardButton("▶️ Watch Now", url=link)],
         [InlineKeyboardButton("📖 How to Open Link", url=HOW_TO_OPEN_LINK)],
     ])
+
+
+async def save_pending_post_state(pending: dict):
+    data = dict(pending)
+    data["updated_at"] = datetime.now(timezone.utc)
+    await sync_col.update_one(
+        {"_id": "pending_post"},
+        {"$set": data},
+        upsert=True,
+    )
+
+
+async def load_pending_post_state():
+    pending = await sync_col.find_one({"_id": "pending_post"})
+    if pending:
+        pending.pop("_id", None)
+    return pending
+
+
+async def clear_pending_post_state():
+    await sync_col.delete_one({"_id": "pending_post"})
+
+
+async def save_latest_thumbnail(post):
+    if post.photo:
+        file_id = post.photo[-1].file_id
+    elif post.document and (post.document.mime_type or "").startswith("image/"):
+        file_id = post.document.file_id
+    else:
+        return None
+
+    thumb_data = {
+        "channel_id": post.chat_id,
+        "message_id": post.message_id,
+        "file_id": file_id,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    await sync_col.update_one(
+        {"_id": "latest_thumbnail"},
+        {"$set": thumb_data},
+        upsert=True,
+    )
+    return thumb_data
+
+
+async def load_latest_thumbnail():
+    thumb = await sync_col.find_one({"_id": "latest_thumbnail"})
+    if thumb:
+        thumb.pop("_id", None)
+    return thumb
+
+
+async def send_post_confirmations(context: ContextTypes.DEFAULT_TYPE, pending: dict, thumb_data: dict, posted_msg_id):
+    confirmation_text = (
+        "✅ post done\n"
+        f"🎬 {pending['name']}\n"
+        f"🔑 token: {pending['token']}\n"
+        f"🗄 storage_msg_id: {pending['storage_msg_id']}\n"
+        f"🖼 thumb_msg_id: {thumb_data.get('message_id', 'n/a')}\n"
+        f"📣 post_msg_id: {posted_msg_id if posted_msg_id else 'n/a'}"
+    )
+
+    target_channels = []
+    if STORAGE_CHANNEL_ID:
+        target_channels.append(STORAGE_CHANNEL_ID)
+    if THUMBNAIL_CHANNEL_ID and THUMBNAIL_CHANNEL_ID != STORAGE_CHANNEL_ID:
+        target_channels.append(THUMBNAIL_CHANNEL_ID)
+
+    for channel_id in target_channels:
+        try:
+            await context.bot.send_message(chat_id=channel_id, text=confirmation_text)
+        except Exception as e:
+            logging.warning(f"Failed to send confirmation to {channel_id}: {e}")
+
+
+async def publish_pending_post(context: ContextTypes.DEFAULT_TYPE, pending: dict, thumb_data: dict):
+    link = f"{GATEWAY_URL}?token={pending['token']}"
+    caption_text = pending.get('caption') or secrets.choice(CAPTIONS)
+    caption = f"{caption_text}\n\nâ± Duration: {pending['duration']}"
+
+    if POST_CHANNEL_ID:
+        posted_message = await context.bot.send_photo(
+            chat_id=POST_CHANNEL_ID,
+            photo=thumb_data['file_id'],
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=get_channel_kb(link),
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="âœ… Auto-post complete using latest thumbnail channel image.",
+            parse_mode="HTML",
+        )
+    else:
+        posted_message = await context.bot.send_photo(
+            chat_id=ADMIN_USER_ID,
+            photo=thumb_data['file_id'],
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=get_channel_kb(link),
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="âœ… Auto-post prepared and sent to admin because POST_CHANNEL_ID is not set.",
+            parse_mode="HTML",
+        )
+
+    await sync_col.update_one(
+        {"_id": f"post:{pending['token']}"},
+        {"$set": {
+            "status": "posted",
+            "token": pending["token"],
+            "file_name": pending["name"],
+            "storage_msg_id": pending["storage_msg_id"],
+            "thumb_msg_id": thumb_data.get("message_id"),
+            "thumb_channel_id": thumb_data.get("channel_id"),
+            "thumb_file_id": thumb_data["file_id"],
+            "post_channel_id": POST_CHANNEL_ID or ADMIN_USER_ID,
+            "post_msg_id": posted_message.message_id,
+            "created_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+
+    await send_post_confirmations(context, pending, thumb_data, posted_message.message_id)
+    _pending_post.pop(ADMIN_USER_ID, None)
+    await clear_pending_post_state()
+    return posted_message
+
+
+async def maybe_auto_post_pending(context: ContextTypes.DEFAULT_TYPE):
+    async with POST_FLOW_LOCK:
+        pending = _pending_post.get(ADMIN_USER_ID)
+        if not pending:
+            pending = await load_pending_post_state()
+            if pending:
+                _pending_post[ADMIN_USER_ID] = pending
+
+        if not pending:
+            return False
+
+        thumb_data = await load_latest_thumbnail()
+        if not thumb_data or not thumb_data.get("file_id"):
+            return False
+
+        pending["thumb"] = thumb_data["file_id"]
+        pending["thumb_msg_id"] = thumb_data.get("message_id")
+        pending["thumb_channel_id"] = thumb_data.get("channel_id")
+        pending["caption"] = pending.get("caption") or secrets.choice(CAPTIONS)
+        _pending_post[ADMIN_USER_ID] = pending
+        await save_pending_post_state(pending)
+
+        try:
+            await publish_pending_post(context, pending, thumb_data)
+            return True
+        except Exception as e:
+            logging.exception("Auto-post failed")
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=f"âŒ Auto-post failed: {e}",
+                parse_mode="HTML",
+            )
+            return False
 
 
 async def is_joined(bot: Bot, user_id: int) -> bool:
@@ -463,6 +630,14 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     link = f"{GATEWAY_URL}?token={token}"
+    pending = {
+        'token': token,
+        'name': file_name,
+        'duration': format_duration(video_duration),
+        'storage_msg_id': post.message_id,
+    }
+    _pending_post[ADMIN_USER_ID] = pending
+    await save_pending_post_state(pending)
 
     # ── Send link to admin ──
     try:
@@ -483,16 +658,49 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Set pending post state — waiting for thumbnail ──
-    _pending_post[ADMIN_USER_ID] = {
-        'token': token,
-        'name': file_name,
-        'duration': format_duration(video_duration),
-    }
+    await context.bot.send_message(
+        chat_id=ADMIN_USER_ID,
+        text="No need to send a private thumbnail now. I will use the latest image from the thumbnail channel.",
+    )
+
+    if not await maybe_auto_post_pending(context):
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=(
+                "No thumbnail is available in the thumbnail channel yet.\n"
+                "As soon as a new image is posted there, I will auto-post this video.\n"
+                "You can still use /skip if you want to post without a thumbnail."
+            ),
+        )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ADMIN SENDS THUMBNAIL (photo in private chat)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def on_thumbnail_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the latest thumbnail from the dedicated channel and auto-complete any waiting post."""
+    post = update.channel_post
+    if not post or post.chat_id != THUMBNAIL_CHANNEL_ID:
+        return
+
+    thumb_data = await save_latest_thumbnail(post)
+    if not thumb_data:
+        return
+
+    await sync_col.update_one(
+        {"_id": "thumbnail_channel_status"},
+        {"$set": {
+            "last_thumb_msg_id": thumb_data["message_id"],
+            "last_thumb_file_id": thumb_data["file_id"],
+            "channel_id": thumb_data["channel_id"],
+            "updated_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+
+    await maybe_auto_post_pending(context)
+
 
 async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin sent a photo — check if there's a pending post waiting for thumbnail."""
@@ -501,6 +709,10 @@ async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pending = _pending_post.get(user_id)
+    if not pending:
+        pending = await load_pending_post_state()
+        if pending:
+            _pending_post[user_id] = pending
     if not pending:
         return  # No pending post, ignore
 
@@ -532,6 +744,10 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pending = _pending_post.get(user_id)
+    if not pending:
+        pending = await load_pending_post_state()
+        if pending:
+            _pending_post[user_id] = pending
     if not pending:
         await update.message.reply_text("❌ No pending post to skip.")
         return
@@ -568,7 +784,9 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
             parse_mode="HTML",
         )
+    await send_post_confirmations(context, pending, {}, None)
     _pending_post.pop(user_id, None)
+    await clear_pending_post_state()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -628,7 +846,17 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
                 parse_mode="HTML",
             )
+        await send_post_confirmations(
+            context,
+            pending,
+            {
+                "message_id": pending.get("thumb_msg_id"),
+                "channel_id": pending.get("thumb_channel_id"),
+            },
+            None,
+        )
         _pending_post.pop(user_id, None)
+        await clear_pending_post_state()
 
     # ── NEW CAPTION ──
     elif q.data == "pc_rot":
@@ -664,6 +892,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await q.message.reply_text("❌ Post cancelled.", parse_mode="HTML")
         _pending_post.pop(user_id, None)
+        await clear_pending_post_state()
 
 
 # ━━━ MAIN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -686,8 +915,8 @@ if __name__ == '__main__':
 
     # Admin sends photo → check if pending post needs thumbnail
     app.add_handler(MessageHandler(
-        filters.Chat(ADMIN_USER_ID) & filters.PHOTO & ~filters.UpdateType.CHANNEL_POST,
-        on_admin_photo,
+        filters.Chat(THUMBNAIL_CHANNEL_ID) & (filters.PHOTO | filters.Document.IMAGE),
+        on_thumbnail_channel_post,
     ))
 
     # Storage channel upload → auto-link + ask thumbnail

@@ -215,6 +215,17 @@ async def mark_post_processed(post_id: int):
     )
 
 
+async def ensure_database_indexes():
+    await processed_posts_col.create_index(
+        [("post_id", 1), ("storage_channel_id", 1), ("processed", 1)],
+        name="processed_post_lookup_idx",
+    )
+
+
+async def post_init(application):
+    await ensure_database_indexes()
+
+
 async def publish_pending_post(context: ContextTypes.DEFAULT_TYPE, pending: dict, thumb_data: dict):
     link = f"{GATEWAY_URL}?token={pending['token']}"
     caption_text = pending.get('caption') or secrets.choice(CAPTIONS)
@@ -790,6 +801,7 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cap = f"{secrets.choice(CAPTIONS)}\n\n⏱ Duration: {pending['duration']}"
 
     # Post directly to channel with BOTH buttons
+    post_sent = False
     if POST_CHANNEL_ID:
         try:
             await context.bot.send_message(
@@ -802,6 +814,7 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ <b>Posted to channel!</b>",
                 parse_mode="HTML",
             )
+            post_sent = True
         except Exception as e:
             await update.message.reply_text(
                 f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID & bot admin rights.",
@@ -818,10 +831,12 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
             parse_mode="HTML",
         )
-    await mark_post_processed(pending["storage_msg_id"])
-    await send_post_confirmations(context, pending, {}, None)
-    _pending_post.pop(user_id, None)
-    await clear_pending_post_state()
+        post_sent = True
+    if post_sent:
+        await mark_post_processed(pending["storage_msg_id"])
+        await send_post_confirmations(context, pending, {}, None)
+        _pending_post.pop(user_id, None)
+        await clear_pending_post_state()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -843,6 +858,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link = f"{GATEWAY_URL}?token={pending['token']}"
         cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
 
+        post_sent = False
         # Remove buttons from preview
         try:
             await q.edit_message_reply_markup(reply_markup=None)
@@ -863,6 +879,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✅ <b>Posted to channel!</b>",
                     parse_mode="HTML",
                 )
+                post_sent = True
             except Exception as e:
                 await q.message.reply_text(
                     f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID & bot admin rights.",
@@ -881,18 +898,20 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
                 parse_mode="HTML",
             )
-        await mark_post_processed(pending["storage_msg_id"])
-        await send_post_confirmations(
-            context,
-            pending,
-            {
-                "message_id": pending.get("thumb_msg_id"),
-                "channel_id": pending.get("thumb_channel_id"),
-            },
-            None,
-        )
-        _pending_post.pop(user_id, None)
-        await clear_pending_post_state()
+            post_sent = True
+        if post_sent:
+            await mark_post_processed(pending["storage_msg_id"])
+            await send_post_confirmations(
+                context,
+                pending,
+                {
+                    "message_id": pending.get("thumb_msg_id"),
+                    "channel_id": pending.get("thumb_channel_id"),
+                },
+                None,
+            )
+            _pending_post.pop(user_id, None)
+            await clear_pending_post_state()
 
     # ── NEW CAPTION ──
     elif q.data == "pc_rot":
@@ -934,7 +953,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ━━━ MAIN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))

@@ -1310,6 +1310,7 @@ if __name__ == '__main__':
     try:
         validate_runtime_config()
         init_database()
+        asyncio.set_event_loop(asyncio.new_event_loop())
         logging.info(
             "Startup config loaded | intake=%s | thumbnail=%s | storage=%s | post=%s",
             INTAKE_CHANNEL_ID,

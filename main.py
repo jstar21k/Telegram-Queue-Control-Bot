@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import json
 import os
 import secrets
 import logging
 import re
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from telegram import (
@@ -52,6 +55,7 @@ HOW_TO_OPEN_LINK = get_env("HOW_TO_OPEN_LINK", default="https://t.me/c/204719457
 THUMBNAIL_UPLOAD_DELAY_SECONDS = get_int_env("THUMBNAIL_UPLOAD_DELAY_SECONDS", default=3)
 INTAKE_GROUP_SETTLE_SECONDS = float(get_env("INTAKE_GROUP_SETTLE_SECONDS", default="2"))
 QUEUE_CONFIRMATION_TEXT = get_env("QUEUE_CONFIRMATION_TEXT", "CONFIRMATION_TEXT", default="post done").strip().lower()
+RENDER_PORT = get_int_env("PORT", default=10000)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -312,6 +316,27 @@ def validate_runtime_config():
         raise RuntimeError(
             "Missing required environment variables: " + ", ".join(missing)
         )
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        payload = json.dumps({"status": "ok"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    server = ThreadingHTTPServer(("0.0.0.0", RENDER_PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logging.info("Health server listening on port %s", RENDER_PORT)
+    return server
 
 
 # ━━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1311,6 +1336,7 @@ if __name__ == '__main__':
         validate_runtime_config()
         init_database()
         asyncio.set_event_loop(asyncio.new_event_loop())
+        start_health_server()
         logging.info(
             "Startup config loaded | intake=%s | thumbnail=%s | storage=%s | post=%s",
             INTAKE_CHANNEL_ID,

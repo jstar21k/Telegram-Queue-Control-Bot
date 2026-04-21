@@ -38,6 +38,7 @@ files_col = db['files']
 users_col = db['users']
 logs_col = db['downloads']
 sync_col = db['bot_sync']
+processed_posts_col = db['processed_posts']
 
 # ━━━ PRELOADED CAPTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CAPTIONS = [
@@ -186,6 +187,34 @@ async def send_post_confirmations(context: ContextTypes.DEFAULT_TYPE, pending: d
             logging.warning(f"Failed to send confirmation to {channel_id}: {e}")
 
 
+async def is_post_processed(post_id: int) -> bool:
+    processed_post = await processed_posts_col.find_one(
+        {
+            "post_id": post_id,
+            "storage_channel_id": STORAGE_CHANNEL_ID,
+            "processed": True,
+        },
+        {"_id": 1},
+    )
+    return processed_post is not None
+
+
+async def mark_post_processed(post_id: int):
+    await processed_posts_col.update_one(
+        {
+            "post_id": post_id,
+            "storage_channel_id": STORAGE_CHANNEL_ID,
+        },
+        {
+            "$set": {
+                "processed": True,
+                "processed_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
 async def publish_pending_post(context: ContextTypes.DEFAULT_TYPE, pending: dict, thumb_data: dict):
     link = f"{GATEWAY_URL}?token={pending['token']}"
     caption_text = pending.get('caption') or secrets.choice(CAPTIONS)
@@ -235,6 +264,7 @@ async def publish_pending_post(context: ContextTypes.DEFAULT_TYPE, pending: dict
         upsert=True,
     )
 
+    await mark_post_processed(pending["storage_msg_id"])
     await send_post_confirmations(context, pending, thumb_data, posted_message.message_id)
     _pending_post.pop(ADMIN_USER_ID, None)
     await clear_pending_post_state()
@@ -604,6 +634,10 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not att or isinstance(att, list):
         return
 
+    if await is_post_processed(post.message_id):
+        logging.info(f"Skipping already processed storage post: {post.message_id}")
+        return
+
     # ── Extract file name (fix: video objects may not have file_name) ──
     if post.video:
         file_name = getattr(post.video, 'file_name', None) or "New_Video"
@@ -784,6 +818,7 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
             parse_mode="HTML",
         )
+    await mark_post_processed(pending["storage_msg_id"])
     await send_post_confirmations(context, pending, {}, None)
     _pending_post.pop(user_id, None)
     await clear_pending_post_state()
@@ -846,6 +881,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
                 parse_mode="HTML",
             )
+        await mark_post_processed(pending["storage_msg_id"])
         await send_post_confirmations(
             context,
             pending,

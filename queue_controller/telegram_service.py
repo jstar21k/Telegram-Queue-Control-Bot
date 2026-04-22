@@ -1,3 +1,4 @@
+import io
 import logging
 
 from .intake import build_transport_caption
@@ -56,6 +57,12 @@ class TelegramQueueSender:
         self.storage_channel_id = storage_channel_id
         self.image_source_channel_id = image_source_channel_id
 
+    async def _download_media_bytes(self, bot, file_id: str) -> bytes | None:
+        telegram_file = await bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await telegram_file.download_to_memory(buffer)
+        return buffer.getvalue()
+
     async def _send_media(self, bot, target_chat_id: int, media: dict, caption: str):
         send_method = media.get("send_method", "send_document")
         file_id = media["file_id"]
@@ -91,6 +98,19 @@ class TelegramQueueSender:
             intake["image"],
             build_transport_caption(post_id, "raw_image"),
         )
+        raw_image_payload = _extract_media_payload(raw_image_message)
+        try:
+            raw_image_payload["raw_bytes"] = await self._download_media_bytes(
+                bot,
+                intake["image"]["file_id"],
+            )
+            raw_image_payload["raw_mime_type"] = intake["image"].get("mime_type")
+            raw_image_payload["raw_file_name"] = intake["image"].get("file_name")
+        except Exception:
+            LOGGER.exception("Failed to download raw image bytes for workflow handoff | postId=%s", post_id)
+            raw_image_payload["raw_bytes"] = None
+            raw_image_payload["raw_mime_type"] = intake["image"].get("mime_type")
+            raw_image_payload["raw_file_name"] = intake["image"].get("file_name")
 
         LOGGER.info(
             "Queued post dispatched | postId=%s | storage_video_message_id=%s | image_source_message_id=%s",
@@ -100,5 +120,5 @@ class TelegramQueueSender:
         )
         return {
             "storage_video": _extract_media_payload(video_message),
-            "image_source": _extract_media_payload(raw_image_message),
+            "image_source": raw_image_payload,
         }

@@ -152,41 +152,51 @@ class QueueStore:
             )
             return existing, False
 
-        set_fields = {
-            "sourceChatId": source_chat_id,
-            "updatedAt": now,
-        }
-        if text_message_id is not None:
-            set_fields["intake.text_message_id"] = text_message_id
-        if media_group_id:
-            set_fields["intake.media_group_id"] = media_group_id
+        if existing:
+            set_fields = {
+                "sourceChatId": source_chat_id,
+                "updatedAt": now,
+            }
+            if text_message_id is not None:
+                set_fields["intake.text_message_id"] = text_message_id
+            if media_group_id:
+                set_fields["intake.media_group_id"] = media_group_id
 
-        document = await self.queue_posts.find_one_and_update(
-            {"postId": post_id},
-            {
-                "$setOnInsert": {
-                    "postId": post_id,
-                    "status": "collecting",
-                    "createdAt": now,
-                    "intake": {
-                        "text_message_id": text_message_id,
-                        "media_group_id": media_group_id,
-                        "video": None,
-                        "image": None,
+            document = await self.queue_posts.find_one_and_update(
+                {"postId": post_id},
+                {"$set": set_fields},
+                return_document=ReturnDocument.AFTER,
+            )
+        else:
+            document = await self.queue_posts.find_one_and_update(
+                {"postId": post_id},
+                {
+                    "$setOnInsert": {
+                        "postId": post_id,
+                        "status": "collecting",
+                        "createdAt": now,
+                        "intake": {
+                            "text_message_id": text_message_id,
+                            "media_group_id": media_group_id,
+                            "video": None,
+                            "image": None,
+                        },
+                        "transport": {
+                            "storage_video": None,
+                            "image_source": None,
+                            "edited_image": None,
+                        },
+                        "publish": {},
+                        "lastError": None,
                     },
-                    "transport": {
-                        "storage_video": None,
-                        "image_source": None,
-                        "edited_image": None,
+                    "$set": {
+                        "sourceChatId": source_chat_id,
+                        "updatedAt": now,
                     },
-                    "publish": {},
-                    "lastError": None,
                 },
-                "$set": set_fields,
-            },
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
         await self.set_current_collecting_post_id(post_id)
         return document, existing is None
 

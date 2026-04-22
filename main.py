@@ -56,6 +56,7 @@ THUMBNAIL_UPLOAD_DELAY_SECONDS = get_int_env("THUMBNAIL_UPLOAD_DELAY_SECONDS", d
 INTAKE_GROUP_SETTLE_SECONDS = float(get_env("INTAKE_GROUP_SETTLE_SECONDS", default="2"))
 QUEUE_CONFIRMATION_TEXT = get_env("QUEUE_CONFIRMATION_TEXT", "CONFIRMATION_TEXT", default="post done").strip().lower()
 RENDER_PORT = get_int_env("PORT", default=10000)
+ENABLE_LEGACY_POSTING_FLOW = get_env("ENABLE_LEGACY_POSTING_FLOW", default="false").lower() == "true"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -655,6 +656,36 @@ async def auto_delete(context: ContextTypes.DEFAULT_TYPE):
 #  COMMAND: /start
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+async def queue_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _active_queue_item
+
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+
+    queue_result = await queue_posts_col.delete_many({"status": {"$ne": "done"}})
+    await sync_col.delete_many(
+        {
+            "_id": {
+                "$in": [
+                    "pending_post",
+                    "latest_thumbnail",
+                    "thumbnail_channel_status",
+                ]
+            }
+        }
+    )
+    _intake_groups.clear()
+    _pending_post.clear()
+    _active_queue_item = None
+
+    await update.message.reply_text(
+        "Queue reset complete.\n"
+        f"Removed {queue_result.deleted_count} active queue items.\n"
+        "Upload a fresh post to the intake channel now."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await users_col.update_one(
@@ -664,6 +695,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ── /start <token> → deliver file with force-join check ──
+    if not ENABLE_LEGACY_POSTING_FLOW:
+        if user.id == ADMIN_USER_ID:
+            await update.message.reply_text(
+                "Queue Controller Bot is active.\n\n"
+                f"Intake: {INTAKE_CHANNEL_ID}\n"
+                f"Thumbnail: {THUMBNAIL_CHANNEL_ID}\n"
+                f"Storage: {STORAGE_CHANNEL_ID}\n\n"
+                "Commands:\n"
+                "/queueclear - remove stuck queue items"
+            )
+        else:
+            await update.message.reply_text("Queue Controller Bot is running.")
+        return
+
     if context.args:
         token = context.args[0]
         file_data = await files_col.find_one({"token": token})
@@ -1352,16 +1397,13 @@ if __name__ == '__main__':
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("skip", skip_thumb))
+    app.add_handler(CommandHandler("queueclear", queue_clear))
 
-    # Force-join verify callback
-    app.add_handler(CallbackQueryHandler(force_join_check, pattern="^check_join$"))
-
-    # Admin panel buttons (stats/status/refresh)
-    app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^(stats|status|refresh)$"))
-
-    # Post preview buttons (send/rotate/rethumb/cancel)
-    app.add_handler(CallbackQueryHandler(post_callback, pattern="^pc_"))
+    if ENABLE_LEGACY_POSTING_FLOW:
+        app.add_handler(CommandHandler("skip", skip_thumb))
+        app.add_handler(CallbackQueryHandler(force_join_check, pattern="^check_join$"))
+        app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^(stats|status|refresh)$"))
+        app.add_handler(CallbackQueryHandler(post_callback, pattern="^pc_"))
 
     # Intake channel post assembly → queue controller
     if INTAKE_CHANNEL_ID:
@@ -1371,10 +1413,11 @@ if __name__ == '__main__':
         ))
 
     # Admin sends photo → check if pending post needs thumbnail
-    app.add_handler(MessageHandler(
-        filters.Chat(THUMBNAIL_CHANNEL_ID) & (filters.PHOTO | filters.Document.IMAGE),
-        on_thumbnail_channel_post,
-    ))
+    if ENABLE_LEGACY_POSTING_FLOW:
+        app.add_handler(MessageHandler(
+            filters.Chat(THUMBNAIL_CHANNEL_ID) & (filters.PHOTO | filters.Document.IMAGE),
+            on_thumbnail_channel_post,
+        ))
 
     # Storage channel confirmation → release next queued post
     app.add_handler(MessageHandler(
@@ -1383,10 +1426,11 @@ if __name__ == '__main__':
     ))
 
     # Storage channel upload → auto-link + ask thumbnail
-    app.add_handler(MessageHandler(
-        filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL | filters.AUDIO),
-        on_storage_upload,
-    ))
+    if ENABLE_LEGACY_POSTING_FLOW:
+        app.add_handler(MessageHandler(
+            filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL | filters.AUDIO),
+            on_storage_upload,
+        ))
 
     print("🚀 JSTAR PRO Bot is Live...")
     try:

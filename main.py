@@ -171,11 +171,31 @@ async def dispatch_queue_item(application, item: dict):
     current = item
     stage = current.get("stage") or "queued"
 
+    logging.info(
+        "Dispatch start | intake_key=%s | stage=%s | thumb_source=%s | video_source=%s",
+        current.get("intake_key"),
+        stage,
+        current.get("thumbnail_source_message_id"),
+        current.get("video_source_message_id"),
+    )
+
     if stage in {"queued", "claimed"}:
+        logging.info(
+            "Sending thumbnail | intake_key=%s | source_chat=%s | source_message_id=%s | target_chat=%s",
+            current.get("intake_key"),
+            current["intake_channel_id"],
+            current["thumbnail_source_message_id"],
+            THUMBNAIL_CHANNEL_ID,
+        )
         thumb_message = await bot.copy_message(
             chat_id=THUMBNAIL_CHANNEL_ID,
             from_chat_id=current["intake_channel_id"],
             message_id=current["thumbnail_source_message_id"],
+        )
+        logging.info(
+            "Thumbnail sent | intake_key=%s | thumbnail_message_id=%s",
+            current.get("intake_key"),
+            thumb_message.message_id,
         )
         current = await update_queue_item(
             current["_id"],
@@ -193,12 +213,29 @@ async def dispatch_queue_item(application, item: dict):
             elapsed = (utcnow() - sent_at).total_seconds()
             remaining = THUMBNAIL_UPLOAD_DELAY_SECONDS - elapsed
             if remaining > 0:
+                logging.info(
+                    "Waiting before video send | intake_key=%s | remaining=%.2fs",
+                    current.get("intake_key"),
+                    remaining,
+                )
                 await asyncio.sleep(remaining)
 
+        logging.info(
+            "Sending video to storage | intake_key=%s | source_chat=%s | source_message_id=%s | target_chat=%s",
+            current.get("intake_key"),
+            current["intake_channel_id"],
+            current["video_source_message_id"],
+            STORAGE_CHANNEL_ID,
+        )
         storage_message = await bot.copy_message(
             chat_id=STORAGE_CHANNEL_ID,
             from_chat_id=current["intake_channel_id"],
             message_id=current["video_source_message_id"],
+        )
+        logging.info(
+            "Video sent to storage | intake_key=%s | storage_message_id=%s",
+            current.get("intake_key"),
+            storage_message.message_id,
         )
         current = await update_queue_item(
             current["_id"],

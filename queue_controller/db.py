@@ -3,13 +3,12 @@ from datetime import datetime, timezone
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, ReturnDocument
-from pymongo.errors import DuplicateKeyError
-
-from .intake import IntakeMedia
 
 
 LOGGER = logging.getLogger(__name__)
 STATE_DOC_ID = "queue_state"
+ACTIVE_STATUSES = {"dispatching", "dispatched", "ready_to_publish", "publishing"}
+TERMINAL_STATUSES = {"published", "failed"}
 
 
 def utcnow() -> datetime:
@@ -49,37 +48,55 @@ class QueueStore:
             name="queue_status_created_at",
         )
         await self.queue_posts.create_index(
-            [("mediaGroupId", ASCENDING)],
-            name="queue_media_group",
+            [("intake.media_group_id", ASCENDING)],
+            name="queue_media_group_lookup",
+            sparse=True,
+        )
+        await self.queue_posts.create_index(
+            [("transport.image_source.message_id", ASCENDING)],
+            name="queue_image_source_message_id",
+            sparse=True,
+        )
+        await self.queue_posts.create_index(
+            [("transport.storage_video.message_id", ASCENDING)],
+            name="queue_storage_video_message_id",
+            sparse=True,
+        )
+        await self.queue_posts.create_index(
+            [("transport.edited_image.message_id", ASCENDING)],
+            name="queue_edited_image_message_id",
             sparse=True,
         )
         await self._ensure_state_document()
 
     async def recover_state(self):
         await self._ensure_state_document()
-        waiting_post = await self.queue_posts.find_one(
-            {"status": "waiting_confirmation"},
-            sort=[("sentAt", ASCENDING), ("createdAt", ASCENDING)],
+        state = await self.queue_state.find_one({"_id": STATE_DOC_ID})
+        active_post_id = (state or {}).get("activePostId")
+
+        if active_post_id and active_post_id != "__dispatching__":
+            active_post = await self.queue_posts.find_one({"postId": active_post_id})
+            if active_post and active_post.get("status") in ACTIVE_STATUSES:
+                return
+
+        recovered = await self.queue_posts.find_one(
+            {"status": {"$in": list(ACTIVE_STATUSES)}},
+            sort=[("createdAt", ASCENDING)],
         )
-        active_post_id = waiting_post["postId"] if waiting_post else None
 
         await self.queue_state.update_one(
             {"_id": STATE_DOC_ID},
             {
                 "$set": {
-                    "activePostId": active_post_id,
+                    "activePostId": recovered["postId"] if recovered else None,
                     "updatedAt": utcnow(),
-                },
-                "$setOnInsert": {
-                    "currentCollectingPostId": None,
-                    "createdAt": utcnow(),
-                },
+                }
             },
             upsert=True,
         )
 
-        if waiting_post:
-            LOGGER.info("Recovered active post from MongoDB | postId=%s", active_post_id)
+        if recovered:
+            LOGGER.info("Recovered active post from MongoDB | postId=%s", recovered["postId"])
 
     async def get_current_collecting_post_id(self) -> str | None:
         await self._ensure_state_document()
@@ -97,24 +114,51 @@ class QueueStore:
                     "currentCollectingPostId": post_id,
                     "updatedAt": utcnow(),
                 },
-                "$setOnInsert": {
-                    "createdAt": utcnow(),
-                    "activePostId": None,
-                },
+                "$setOnInsert": {"createdAt": utcnow(), "activePostId": None},
             },
             upsert=True,
         )
 
-    async def upsert_post_label(self, post_id: str, text_message_id: int | None, source_chat_id: int):
+    async def get_active_post_id(self) -> str | None:
+        await self._ensure_state_document()
+        state = await self.queue_state.find_one({"_id": STATE_DOC_ID}, {"activePostId": 1})
+        if not state:
+            return None
+        return state.get("activePostId")
+
+    async def get_post(self, post_id: str):
+        return await self.queue_posts.find_one({"postId": post_id})
+
+    async def find_post_by_media_group(self, media_group_id: str | None):
+        if not media_group_id:
+            return None
+        return await self.queue_posts.find_one({"intake.media_group_id": media_group_id})
+
+    async def upsert_post_label(
+        self,
+        post_id: str,
+        text_message_id: int | None,
+        source_chat_id: int,
+        media_group_id: str | None = None,
+    ):
         now = utcnow()
         existing = await self.queue_posts.find_one({"postId": post_id})
-        if existing and existing.get("status") not in {"collecting", "pending"}:
+        if existing and existing.get("status") not in {"collecting", "queued"}:
             LOGGER.warning(
-                "Duplicate postId ignored | postId=%s | status=%s",
+                "Duplicate postId ignored because record is already active or finished | postId=%s | status=%s",
                 post_id,
                 existing.get("status"),
             )
             return existing, False
+
+        set_fields = {
+            "sourceChatId": source_chat_id,
+            "updatedAt": now,
+        }
+        if text_message_id is not None:
+            set_fields["intake.text_message_id"] = text_message_id
+        if media_group_id:
+            set_fields["intake.media_group_id"] = media_group_id
 
         document = await self.queue_posts.find_one_and_update(
             {"postId": post_id},
@@ -123,75 +167,65 @@ class QueueStore:
                     "postId": post_id,
                     "status": "collecting",
                     "createdAt": now,
-                    "videoFileId": None,
-                    "imageFileId": None,
-                    "videoMessageId": None,
-                    "imageMessageId": None,
-                    "mediaGroupId": None,
-                    "sentAt": None,
-                    "confirmedAt": None,
-                    "videoConfirmedAt": None,
-                    "imageConfirmedAt": None,
-                    "videoConfirmed": False,
-                    "imageConfirmed": False,
+                    "intake": {
+                        "text_message_id": text_message_id,
+                        "media_group_id": media_group_id,
+                        "video": None,
+                        "image": None,
+                    },
+                    "transport": {
+                        "storage_video": None,
+                        "image_source": None,
+                        "edited_image": None,
+                    },
+                    "publish": {},
+                    "lastError": None,
                 },
-                "$set": {
-                    "sourceChatId": source_chat_id,
-                    "updatedAt": now,
-                },
+                "$set": set_fields,
             },
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
-        if text_message_id is not None:
-            await self.queue_posts.update_one(
-                {"postId": post_id},
-                {"$set": {"textMessageId": text_message_id, "updatedAt": now}},
-            )
-            document["textMessageId"] = text_message_id
         await self.set_current_collecting_post_id(post_id)
-        created = existing is None
-        return document, created
+        return document, existing is None
 
-    async def attach_media(self, post_id: str, source_chat_id: int, media: IntakeMedia):
-        field_map = {
-            "video": ("videoFileId", "videoMessageId"),
-            "image": ("imageFileId", "imageMessageId"),
-        }
-        file_field, msg_field = field_map[media.kind]
-
-        document = await self.queue_posts.find_one_and_update(
-            {"postId": post_id},
-            {
-                "$set": {
-                    file_field: media.file_id,
-                    msg_field: media.source_message_id,
-                    "mediaGroupId": media.media_group_id,
-                    "sourceChatId": source_chat_id,
-                    "updatedAt": utcnow(),
-                }
+    async def attach_media(self, post_id: str, source_chat_id: int, media):
+        update_fields = {
+            f"intake.{media.kind}": {
+                "file_id": media.file_id,
+                "message_id": media.source_message_id,
+                "media_group_id": media.media_group_id,
+                "mime_type": media.mime_type,
+                "file_name": media.file_name,
+                "duration": media.duration,
+                "send_method": media.send_method,
             },
+            "sourceChatId": source_chat_id,
+            "updatedAt": utcnow(),
+        }
+        if media.media_group_id:
+            update_fields["intake.media_group_id"] = media.media_group_id
+
+        return await self.queue_posts.find_one_and_update(
+            {"postId": post_id},
+            {"$set": update_fields},
             return_document=ReturnDocument.AFTER,
         )
-        return document
 
-    async def mark_pending_if_complete(self, post_id: str):
-        post = await self.queue_posts.find_one({"postId": post_id})
+    async def mark_queued_if_complete(self, post_id: str):
+        post = await self.get_post(post_id)
         if not post:
             return None, False
 
-        is_complete = bool(
-            post.get("textMessageId")
-            and post.get("videoFileId")
-            and post.get("imageFileId")
-        )
+        intake = post.get("intake") or {}
+        is_complete = bool(intake.get("video") and intake.get("image"))
         if not is_complete:
             return post, False
 
         if post.get("status") == "collecting":
             post = await self.queue_posts.find_one_and_update(
                 {"postId": post_id, "status": "collecting"},
-                {"$set": {"status": "pending", "updatedAt": utcnow()}},
+                {"$set": {"status": "queued", "updatedAt": utcnow()}},
                 return_document=ReturnDocument.AFTER,
             )
             current_collecting = await self.get_current_collecting_post_id()
@@ -199,71 +233,63 @@ class QueueStore:
                 await self.set_current_collecting_post_id(None)
             return post, True
 
-        return post, post.get("status") == "pending"
+        return post, post.get("status") == "queued"
 
-    async def claim_next_pending_post(self):
-        now = utcnow()
-        await self._ensure_state_document()
-        state = await self.queue_state.find_one_and_update(
-            {
-                "_id": STATE_DOC_ID,
-                "$or": [
-                    {"activePostId": None},
-                    {"activePostId": {"$exists": False}},
-                ],
-            },
-            {
-                "$set": {
-                    "activePostId": "__dispatching__",
-                    "updatedAt": now,
-                },
-            },
-            return_document=ReturnDocument.AFTER,
+    async def _release_active_if_terminal(self):
+        active_post_id = await self.get_active_post_id()
+        if not active_post_id or active_post_id == "__dispatching__":
+            return
+
+        active_post = await self.get_post(active_post_id)
+        if active_post and active_post.get("status") not in TERMINAL_STATUSES:
+            return
+
+        await self.queue_state.update_one(
+            {"_id": STATE_DOC_ID, "activePostId": active_post_id},
+            {"$set": {"activePostId": None, "updatedAt": utcnow()}},
         )
 
+    async def claim_next_post_for_dispatch(self):
+        await self._ensure_state_document()
+        await self._release_active_if_terminal()
+
+        state = await self.queue_state.find_one_and_update(
+            {"_id": STATE_DOC_ID, "activePostId": None},
+            {"$set": {"activePostId": "__dispatching__", "updatedAt": utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
         if not state or state.get("activePostId") != "__dispatching__":
             return None
 
         post = await self.queue_posts.find_one_and_update(
-            {
-                "status": "pending",
-                "textMessageId": {"$ne": None},
-                "videoFileId": {"$ne": None},
-                "imageFileId": {"$ne": None},
-            },
-            {
-                "$set": {
-                    "status": "waiting_confirmation",
-                    "sentAt": now,
-                    "updatedAt": now,
-                }
-            },
+            {"status": "queued", "intake.video": {"$ne": None}, "intake.image": {"$ne": None}},
+            {"$set": {"status": "dispatching", "dispatchClaimedAt": utcnow(), "updatedAt": utcnow()}},
             sort=[("createdAt", ASCENDING)],
             return_document=ReturnDocument.AFTER,
         )
-
         if not post:
             await self.queue_state.update_one(
                 {"_id": STATE_DOC_ID},
                 {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-                upsert=True,
             )
             return None
 
         await self.queue_state.update_one(
             {"_id": STATE_DOC_ID},
             {"$set": {"activePostId": post["postId"], "updatedAt": utcnow()}},
-            upsert=True,
         )
         return post
 
-    async def save_storage_message_ids(self, post_id: str, video_message_id: int, image_message_id: int):
+    async def mark_dispatched(self, post_id: str, storage_video: dict, image_source: dict):
         await self.queue_posts.update_one(
             {"postId": post_id},
             {
                 "$set": {
-                    "storageVideoMessageId": video_message_id,
-                    "imageChannelMessageId": image_message_id,
+                    "status": "dispatched",
+                    "transport.storage_video": storage_video,
+                    "transport.image_source": image_source,
+                    "lastError": None,
+                    "dispatchedAt": utcnow(),
                     "updatedAt": utcnow(),
                 }
             },
@@ -280,77 +306,9 @@ class QueueStore:
                 }
             },
         )
-        await self._ensure_state_document()
-        await self.queue_state.update_one(
-            {"_id": STATE_DOC_ID, "activePostId": post_id},
-            {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-        )
-
-    async def confirm_post(self, post_id: str, confirmation_kind: str | None):
-        post = await self.queue_posts.find_one({"postId": post_id})
-        if not post:
-            return None
-
-        if post.get("status") == "confirmed":
-            await self._ensure_state_document()
-            await self.queue_state.update_one(
-                {"_id": STATE_DOC_ID, "activePostId": post_id},
-                {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-            )
-            return post
-
-        if post.get("status") != "waiting_confirmation":
-            return None
-
-        now = utcnow()
-        update_fields = {"updatedAt": now}
-
-        if confirmation_kind == "video":
-            update_fields["videoConfirmed"] = True
-            update_fields["videoConfirmedAt"] = now
-        elif confirmation_kind == "image":
-            update_fields["imageConfirmed"] = True
-            update_fields["imageConfirmedAt"] = now
-        else:
-            update_fields["videoConfirmed"] = True
-            update_fields["videoConfirmedAt"] = now
-            update_fields["imageConfirmed"] = True
-            update_fields["imageConfirmedAt"] = now
-
-        updated_post = await self.queue_posts.find_one_and_update(
-            {"postId": post_id, "status": "waiting_confirmation"},
-            {"$set": update_fields},
-            return_document=ReturnDocument.AFTER,
-        )
-        if not updated_post:
-            return None
-
-        if updated_post.get("videoConfirmed") and updated_post.get("imageConfirmed"):
-            updated_post = await self.queue_posts.find_one_and_update(
-                {
-                    "postId": post_id,
-                    "status": "waiting_confirmation",
-                    "videoConfirmed": True,
-                    "imageConfirmed": True,
-                },
-                {
-                    "$set": {
-                        "status": "confirmed",
-                        "confirmedAt": now,
-                        "updatedAt": now,
-                    }
-                },
-                return_document=ReturnDocument.AFTER,
-            )
-            await self._ensure_state_document()
-            await self.queue_state.update_one(
-                {"_id": STATE_DOC_ID, "activePostId": post_id},
-                {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-            )
-        return updated_post
 
     async def clear_queue(self):
-        result = await self.queue_posts.delete_many({"status": {"$ne": "confirmed"}})
+        result = await self.queue_posts.delete_many({"status": {"$nin": ["published"]}})
         await self.queue_state.update_one(
             {"_id": STATE_DOC_ID},
             {
@@ -373,10 +331,3 @@ class QueueStore:
         async for row in cursor:
             counts[row["_id"]] = row["count"]
         return counts
-
-    async def get_active_post_id(self):
-        await self._ensure_state_document()
-        state = await self.queue_state.find_one({"_id": STATE_DOC_ID}, {"activePostId": 1})
-        if not state:
-            return None
-        return state.get("activePostId")

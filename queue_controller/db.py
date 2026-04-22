@@ -23,6 +23,21 @@ class QueueStore:
         self.queue_posts = self._db["queue_posts"]
         self.queue_state = self._db["queue_state"]
 
+    async def _ensure_state_document(self):
+        now = utcnow()
+        await self.queue_state.update_one(
+            {"_id": STATE_DOC_ID},
+            {
+                "$setOnInsert": {
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "activePostId": None,
+                    "currentCollectingPostId": None,
+                }
+            },
+            upsert=True,
+        )
+
     async def ensure_indexes(self):
         await self.queue_posts.create_index(
             [("postId", ASCENDING)],
@@ -38,8 +53,10 @@ class QueueStore:
             name="queue_media_group",
             sparse=True,
         )
+        await self._ensure_state_document()
 
     async def recover_state(self):
+        await self._ensure_state_document()
         waiting_post = await self.queue_posts.find_one(
             {"status": "waiting_confirmation"},
             sort=[("sentAt", ASCENDING), ("createdAt", ASCENDING)],
@@ -65,12 +82,14 @@ class QueueStore:
             LOGGER.info("Recovered active post from MongoDB | postId=%s", active_post_id)
 
     async def get_current_collecting_post_id(self) -> str | None:
+        await self._ensure_state_document()
         state = await self.queue_state.find_one({"_id": STATE_DOC_ID}, {"currentCollectingPostId": 1})
         if not state:
             return None
         return state.get("currentCollectingPostId")
 
     async def set_current_collecting_post_id(self, post_id: str | None):
+        await self._ensure_state_document()
         await self.queue_state.update_one(
             {"_id": STATE_DOC_ID},
             {
@@ -184,6 +203,7 @@ class QueueStore:
 
     async def claim_next_pending_post(self):
         now = utcnow()
+        await self._ensure_state_document()
         state = await self.queue_state.find_one_and_update(
             {
                 "_id": STATE_DOC_ID,
@@ -197,12 +217,7 @@ class QueueStore:
                     "activePostId": "__dispatching__",
                     "updatedAt": now,
                 },
-                "$setOnInsert": {
-                    "createdAt": now,
-                    "currentCollectingPostId": None,
-                },
             },
-            upsert=True,
             return_document=ReturnDocument.AFTER,
         )
 
@@ -265,10 +280,10 @@ class QueueStore:
                 }
             },
         )
+        await self._ensure_state_document()
         await self.queue_state.update_one(
             {"_id": STATE_DOC_ID, "activePostId": post_id},
             {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-            upsert=True,
         )
 
     async def confirm_post(self, post_id: str, confirmation_kind: str | None):
@@ -277,10 +292,10 @@ class QueueStore:
             return None
 
         if post.get("status") == "confirmed":
+            await self._ensure_state_document()
             await self.queue_state.update_one(
                 {"_id": STATE_DOC_ID, "activePostId": post_id},
                 {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-                upsert=True,
             )
             return post
 
@@ -327,10 +342,10 @@ class QueueStore:
                 },
                 return_document=ReturnDocument.AFTER,
             )
+            await self._ensure_state_document()
             await self.queue_state.update_one(
                 {"_id": STATE_DOC_ID, "activePostId": post_id},
                 {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-                upsert=True,
             )
         return updated_post
 
@@ -360,6 +375,7 @@ class QueueStore:
         return counts
 
     async def get_active_post_id(self):
+        await self._ensure_state_document()
         state = await self.queue_state.find_one({"_id": STATE_DOC_ID}, {"activePostId": 1})
         if not state:
             return None

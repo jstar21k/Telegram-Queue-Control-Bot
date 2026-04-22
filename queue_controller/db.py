@@ -23,6 +23,15 @@ class QueueStore:
         self.queue_posts = self._db["queue_posts"]
         self.queue_state = self._db["queue_state"]
 
+    async def _drop_legacy_indexes(self):
+        async for index in self.queue_posts.list_indexes():
+            name = index.get("name")
+            key = list((index.get("key") or {}).items())
+
+            if name == "queue_intake_key_unique_idx" or key == [("intake_key", 1)]:
+                LOGGER.warning("Dropping legacy queue_posts index | name=%s | key=%s", name, key)
+                await self.queue_posts.drop_index(name)
+
     async def _ensure_state_document(self):
         now = utcnow()
         await self.queue_state.update_one(
@@ -39,6 +48,7 @@ class QueueStore:
         )
 
     async def ensure_indexes(self):
+        await self._drop_legacy_indexes()
         await self.queue_posts.create_index(
             [("postId", ASCENDING)],
             unique=True,

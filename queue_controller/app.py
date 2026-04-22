@@ -171,12 +171,48 @@ class QueueControllerBot:
             return
 
         if post_id:
-            await self.store.upsert_post_label(
+            label_doc, _ = await self.store.upsert_post_label(
                 target_post_id,
                 None,
                 message.chat_id,
                 media.media_group_id,
             )
+            if label_doc and label_doc.get("status") not in {"collecting", "queued"}:
+                LOGGER.warning(
+                    "Media ignored because post cannot accept new assets | postId=%s | status=%s",
+                    target_post_id,
+                    label_doc.get("status"),
+                )
+                return
+
+        existing_post = await self.store.get_post(target_post_id)
+        if not existing_post:
+            LOGGER.warning(
+                "Media ignored because target post does not exist | postId=%s | kind=%s",
+                target_post_id,
+                media.kind,
+            )
+            return
+
+        if existing_post.get("status") != "collecting":
+            LOGGER.warning(
+                "Media ignored because post is no longer collecting | postId=%s | status=%s | kind=%s",
+                target_post_id,
+                existing_post.get("status"),
+                media.kind,
+            )
+            return
+
+        existing_media = ((existing_post.get("intake") or {}).get(media.kind) or {})
+        if existing_media.get("message_id") and existing_media.get("message_id") != media.source_message_id:
+            LOGGER.warning(
+                "Extra %s ignored because post already has one attached | postId=%s | existingMessageId=%s | newMessageId=%s",
+                media.kind,
+                target_post_id,
+                existing_media.get("message_id"),
+                media.source_message_id,
+            )
+            return
 
         LOGGER.info(
             "Attaching media to post | postId=%s | kind=%s | messageId=%s",

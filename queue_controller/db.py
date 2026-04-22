@@ -208,7 +208,7 @@ class QueueStore:
             update_fields["intake.media_group_id"] = media.media_group_id
 
         return await self.queue_posts.find_one_and_update(
-            {"postId": post_id},
+            {"postId": post_id, "status": "collecting"},
             {"$set": update_fields},
             return_document=ReturnDocument.AFTER,
         )

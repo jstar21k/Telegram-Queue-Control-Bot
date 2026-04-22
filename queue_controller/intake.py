@@ -3,10 +3,10 @@ import re
 
 
 EXPLICIT_POST_ID_RE = re.compile(
-    r"\bpost[_\s-]*id\s*[:=]\s*([A-Za-z0-9_-]+)\b",
+    r"\bpost[_\s-]*id\s*[:=]\s*(post_\d{8}_\d{3,})\b",
     re.IGNORECASE,
 )
-GENERIC_POST_ID_RE = re.compile(r"\b(post[_-]?[A-Za-z0-9_-]+)\b", re.IGNORECASE)
+GENERIC_POST_ID_RE = re.compile(r"\b(post_\d{8}_\d{3,})\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -22,12 +22,7 @@ class IntakeMedia:
 
 
 def canonicalize_post_id(value: str) -> str:
-    cleaned = re.sub(r"\s+", "_", value.strip())
-    if not cleaned:
-        return cleaned
-    if not cleaned.upper().startswith("POST"):
-        cleaned = f"POST_{cleaned}"
-    return cleaned.upper()
+    return value.strip().upper()
 
 
 def normalize_post_id(raw_text: str | None) -> str | None:

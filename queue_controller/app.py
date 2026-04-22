@@ -10,6 +10,7 @@ from .telegram_service import TelegramQueueSender
 
 
 LOGGER = logging.getLogger(__name__)
+PUBLISHED_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 class QueueControllerBot:
@@ -33,10 +34,25 @@ class QueueControllerBot:
             first=1,
             name="queue-dispatch-loop",
         )
+        application.job_queue.run_repeating(
+            self.cleanup_tick,
+            interval=PUBLISHED_CLEANUP_INTERVAL_SECONDS,
+            first=60,
+            name="queue-published-cleanup",
+        )
+        await self.cleanup_published_records()
         await self.dispatch_next(application)
 
     async def dispatch_tick(self, context: ContextTypes.DEFAULT_TYPE):
         await self.dispatch_next(context.application)
+
+    async def cleanup_tick(self, context: ContextTypes.DEFAULT_TYPE):
+        await self.cleanup_published_records()
+
+    async def cleanup_published_records(self):
+        removed = await self.store.cleanup_published_posts()
+        if removed:
+            LOGGER.info("Cleaned up published queue posts | removed=%s", removed)
 
     async def dispatch_next(self, application):
         post = await self.store.claim_next_post_for_dispatch()

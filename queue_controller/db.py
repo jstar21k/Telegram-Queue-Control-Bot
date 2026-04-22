@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, ReturnDocument
@@ -9,6 +9,7 @@ LOGGER = logging.getLogger(__name__)
 STATE_DOC_ID = "queue_state"
 ACTIVE_STATUSES = {"dispatching", "dispatched", "ready_to_publish", "publishing"}
 TERMINAL_STATUSES = {"published", "failed"}
+PUBLISHED_RETENTION_HOURS = 24
 
 
 def utcnow() -> datetime:
@@ -331,3 +332,21 @@ class QueueStore:
         async for row in cursor:
             counts[row["_id"]] = row["count"]
         return counts
+
+    async def cleanup_published_posts(self, retention_hours: int = PUBLISHED_RETENTION_HOURS):
+        cutoff = utcnow()
+        cutoff = cutoff.replace(microsecond=0)
+        cutoff = cutoff - timedelta(hours=retention_hours)
+        result = await self.queue_posts.delete_many(
+            {
+                "status": "published",
+                "$or": [
+                    {"publish.posted_at": {"$lte": cutoff}},
+                    {
+                        "publish.posted_at": {"$exists": False},
+                        "updatedAt": {"$lte": cutoff},
+                    },
+                ],
+            }
+        )
+        return result.deleted_count

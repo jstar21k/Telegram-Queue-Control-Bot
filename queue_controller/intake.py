@@ -3,7 +3,10 @@ import re
 
 
 POST_ID_RE = re.compile(r"\bpost[\s_-]*0*(\d+)\b", re.IGNORECASE)
-CONFIRMATION_RE = re.compile(r"^\s*(post[\s_-]*\d+)\s+done\b", re.IGNORECASE)
+CONFIRMATION_RE = re.compile(
+    r"^\s*(post[\s_-]*\d+)(?:\s+(video|image))?\s+done\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,19 @@ def extract_confirmation_post_id(text: str | None) -> str | None:
     if not match:
         return None
     return normalize_post_id(match.group(1))
+
+
+def extract_confirmation_details(text: str | None) -> tuple[str | None, str | None]:
+    if not text:
+        return None, None
+
+    match = CONFIRMATION_RE.search(text)
+    if not match:
+        return None, None
+
+    post_id = normalize_post_id(match.group(1))
+    confirmation_kind = (match.group(2) or "").lower() or None
+    return post_id, confirmation_kind
 
 
 def detect_intake_media(message) -> IntakeMedia | None:

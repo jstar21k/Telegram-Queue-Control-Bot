@@ -111,6 +111,10 @@ class QueueStore:
                     "mediaGroupId": None,
                     "sentAt": None,
                     "confirmedAt": None,
+                    "videoConfirmedAt": None,
+                    "imageConfirmedAt": None,
+                    "videoConfirmed": False,
+                    "imageConfirmed": False,
                 },
                 "$set": {
                     "sourceChatId": source_chat_id,
@@ -244,7 +248,7 @@ class QueueStore:
             {
                 "$set": {
                     "storageVideoMessageId": video_message_id,
-                    "storageImageMessageId": image_message_id,
+                    "imageChannelMessageId": image_message_id,
                     "updatedAt": utcnow(),
                 }
             },
@@ -267,7 +271,7 @@ class QueueStore:
             upsert=True,
         )
 
-    async def confirm_post(self, post_id: str):
+    async def confirm_post(self, post_id: str, confirmation_kind: str | None):
         post = await self.queue_posts.find_one({"postId": post_id})
         if not post:
             return None
@@ -283,23 +287,52 @@ class QueueStore:
         if post.get("status") != "waiting_confirmation":
             return None
 
-        confirmed_post = await self.queue_posts.find_one_and_update(
+        now = utcnow()
+        update_fields = {"updatedAt": now}
+
+        if confirmation_kind == "video":
+            update_fields["videoConfirmed"] = True
+            update_fields["videoConfirmedAt"] = now
+        elif confirmation_kind == "image":
+            update_fields["imageConfirmed"] = True
+            update_fields["imageConfirmedAt"] = now
+        else:
+            update_fields["videoConfirmed"] = True
+            update_fields["videoConfirmedAt"] = now
+            update_fields["imageConfirmed"] = True
+            update_fields["imageConfirmedAt"] = now
+
+        updated_post = await self.queue_posts.find_one_and_update(
             {"postId": post_id, "status": "waiting_confirmation"},
-            {
-                "$set": {
-                    "status": "confirmed",
-                    "confirmedAt": utcnow(),
-                    "updatedAt": utcnow(),
-                }
-            },
+            {"$set": update_fields},
             return_document=ReturnDocument.AFTER,
         )
-        await self.queue_state.update_one(
-            {"_id": STATE_DOC_ID, "activePostId": post_id},
-            {"$set": {"activePostId": None, "updatedAt": utcnow()}},
-            upsert=True,
-        )
-        return confirmed_post
+        if not updated_post:
+            return None
+
+        if updated_post.get("videoConfirmed") and updated_post.get("imageConfirmed"):
+            updated_post = await self.queue_posts.find_one_and_update(
+                {
+                    "postId": post_id,
+                    "status": "waiting_confirmation",
+                    "videoConfirmed": True,
+                    "imageConfirmed": True,
+                },
+                {
+                    "$set": {
+                        "status": "confirmed",
+                        "confirmedAt": now,
+                        "updatedAt": now,
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            await self.queue_state.update_one(
+                {"_id": STATE_DOC_ID, "activePostId": post_id},
+                {"$set": {"activePostId": None, "updatedAt": utcnow()}},
+                upsert=True,
+            )
+        return updated_post
 
     async def clear_queue(self):
         result = await self.queue_posts.delete_many({"status": {"$ne": "confirmed"}})

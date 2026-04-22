@@ -46,10 +46,14 @@ def validate_settings(settings):
         missing.append("MONGODB_URI")
     if not settings.intake_channel_id:
         missing.append("INTAKE_CHANNEL_ID / INTAKE_CHAT_ID")
-    if not settings.storage_channel_id:
-        missing.append("STORAGE_CHANNEL_ID / STORAGE_CHAT_ID")
-    if not settings.confirmation_chat_id:
-        missing.append("CONFIRMATION_CHAT_ID / CONTROL_CHAT_ID / STORAGE_CHANNEL_ID")
+    if not settings.video_storage_channel_id:
+        missing.append("VIDEO_STORAGE_CHANNEL_ID / STORAGE_CHANNEL_ID / STORAGE_CHAT_ID")
+    if not settings.image_channel_id:
+        missing.append("IMAGE_CHANNEL_ID / IMAGE_DEST_CHANNEL_ID / THUMBNAIL_CHANNEL_ID")
+    if not settings.video_confirmation_chat_id:
+        missing.append("VIDEO_CONFIRMATION_CHAT_ID / CONFIRMATION_CHAT_ID / CONTROL_CHAT_ID")
+    if not settings.image_confirmation_chat_id:
+        missing.append("IMAGE_CONFIRMATION_CHAT_ID")
 
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
@@ -63,10 +67,12 @@ def main():
     start_health_server(settings.health_port)
 
     LOGGER.info(
-        "Startup config loaded | intake=%s | storage=%s | confirmation=%s",
+        "Startup config loaded | intake=%s | video_storage=%s | image_channel=%s | video_confirmation=%s | image_confirmation=%s",
         settings.intake_channel_id,
-        settings.storage_channel_id,
-        settings.confirmation_chat_id,
+        settings.video_storage_channel_id,
+        settings.image_channel_id,
+        settings.video_confirmation_chat_id,
+        settings.image_confirmation_chat_id,
     )
 
     application = build_application(settings)

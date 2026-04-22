@@ -5,7 +5,11 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 
 from .config import Settings
 from .db import QueueStore
-from .intake import detect_intake_media, extract_confirmation_post_id, extract_post_id_from_message
+from .intake import (
+    detect_intake_media,
+    extract_confirmation_details,
+    extract_post_id_from_message,
+)
 from .telegram_service import TelegramQueueSender
 
 
@@ -16,7 +20,10 @@ class QueueControllerBot:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.store = QueueStore(settings.mongodb_uri, settings.mongo_db_name)
-        self.sender = TelegramQueueSender(settings.storage_channel_id)
+        self.sender = TelegramQueueSender(
+            settings.video_storage_channel_id,
+            settings.image_channel_id,
+        )
 
     def is_admin(self, user_id: int) -> bool:
         return self.settings.admin_user_id == 0 or user_id == self.settings.admin_user_id
@@ -54,8 +61,10 @@ class QueueControllerBot:
             await update.message.reply_text(
                 "Queue Controller Bot is active.\n\n"
                 f"Intake Channel: {self.settings.intake_channel_id}\n"
-                f"Storage Channel: {self.settings.storage_channel_id}\n"
-                f"Confirmation Chat: {self.settings.confirmation_chat_id}\n"
+                f"Video Storage Channel: {self.settings.video_storage_channel_id}\n"
+                f"Image Channel: {self.settings.image_channel_id}\n"
+                f"Video Confirmation Chat: {self.settings.video_confirmation_chat_id}\n"
+                f"Image Confirmation Chat: {self.settings.image_confirmation_chat_id}\n"
                 f"Active Post: {active_post_id or 'none'}"
             )
             return
@@ -164,19 +173,42 @@ class QueueControllerBot:
 
     async def confirmation_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.channel_post
-        if not message or message.chat_id != self.settings.confirmation_chat_id or not message.text:
+        if not message or message.chat_id not in {
+            self.settings.video_confirmation_chat_id,
+            self.settings.image_confirmation_chat_id,
+        } or not message.text:
             return
 
-        post_id = extract_confirmation_post_id(message.text)
+        post_id, explicit_kind = extract_confirmation_details(message.text)
         if not post_id:
             LOGGER.warning("invalid confirmation message ignored | text=%s", message.text[:200])
             return
 
-        LOGGER.info("confirmation received | postId=%s | messageId=%s", post_id, message.message_id)
-        post = await self.store.confirm_post(post_id)
+        confirmation_kind = explicit_kind
+        if not confirmation_kind:
+            if message.chat_id == self.settings.video_confirmation_chat_id:
+                confirmation_kind = "video"
+            elif message.chat_id == self.settings.image_confirmation_chat_id:
+                confirmation_kind = "image"
+
+        LOGGER.info(
+            "confirmation received | postId=%s | kind=%s | messageId=%s",
+            post_id,
+            confirmation_kind,
+            message.message_id,
+        )
+        post = await self.store.confirm_post(post_id, confirmation_kind)
         if not post:
             LOGGER.warning("Confirmation ignored because post is not waiting | postId=%s", post_id)
             return
+
+        if post.get("status") == "confirmed":
+            LOGGER.info("post fully confirmed | postId=%s", post_id)
+        else:
+            if not post.get("videoConfirmed"):
+                LOGGER.info("waiting for video confirmation | postId=%s", post_id)
+            if not post.get("imageConfirmed"):
+                LOGGER.info("waiting for image confirmation | postId=%s", post_id)
 
         await self.dispatch_next(context.application)
 
@@ -194,7 +226,9 @@ def build_application(settings: Settings):
     )
     application.add_handler(MessageHandler(intake_filter, controller.intake_handler))
 
-    confirmation_filter = filters.Chat(settings.confirmation_chat_id) & filters.TEXT
+    confirmation_filter = filters.Chat(
+        [settings.video_confirmation_chat_id, settings.image_confirmation_chat_id]
+    ) & filters.TEXT
     application.add_handler(MessageHandler(confirmation_filter, controller.confirmation_handler))
 
     return application

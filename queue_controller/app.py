@@ -55,6 +55,8 @@ class QueueControllerBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user:
             return
+        if not update.message:
+            return
 
         if self.is_admin(update.effective_user.id):
             active_post_id = await self.store.get_active_post_id()
@@ -72,7 +74,10 @@ class QueueControllerBot:
         await update.message.reply_text("Queue Controller Bot is running.")
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user or not self.is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message:
+            return
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text("You are not authorized to use this command.")
             return
 
         counts = await self.store.get_status_counts()
@@ -90,13 +95,19 @@ class QueueControllerBot:
         )
 
     async def queue_clear_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user or not self.is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message:
+            return
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text("You are not authorized to use this command.")
             return
 
         removed = await self.store.clear_queue()
         await update.message.reply_text(
             f"Queue reset complete. Removed {removed} non-confirmed posts."
         )
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        LOGGER.exception("Unhandled Telegram update error", exc_info=context.error)
 
     async def intake_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.channel_post
@@ -230,5 +241,6 @@ def build_application(settings: Settings):
         [settings.video_confirmation_chat_id, settings.image_confirmation_chat_id]
     ) & filters.TEXT
     application.add_handler(MessageHandler(confirmation_filter, controller.confirmation_handler))
+    application.add_error_handler(controller.error_handler)
 
     return application
